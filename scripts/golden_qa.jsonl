@@ -1,0 +1,8 @@
+{"question": "What does digitalWrite do?", "expect_contains": ["HIGH", "LOW"]}
+{"question": "What are the pinMode modes?", "expect_contains": ["INPUT", "OUTPUT"]}
+{"question": "What range does analogRead return on a 10-bit ADC?", "expect_contains": ["1023"]}
+{"question": "How do I start Serial at 9600 baud?", "expect_contains": ["9600"]}
+{"question": "What does millis return?", "expect_contains": ["milliseconds"]}
+{"question": "What is the PWM value range for analogWrite?", "expect_contains": ["255"]}
+{"question": "Why is delay problematic in sketches?", "expect_contains": ["delay"]}
+{"question": "How do I configure a quantum flux capacitor on Arduino?", "expect_dont_know": true}

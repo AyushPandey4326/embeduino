@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html>
+<head><title>delay() - Arduino Reference</title></head>
+<body>
+<article>
+<h1>delay()</h1>
+<p><a href="https://docs.arduino.cc/language-reference/">Language Reference</a> › Time</p>
+<h2>Description</h2>
+<p>Pauses the program for the amount of time (in milliseconds) specified as parameter. (There are 1000 milliseconds in a second.)</p>
+<h2>Syntax</h2>
+<pre><code class="language-cpp">delay(ms)</code></pre>
+<h2>Parameters</h2>
+<ul>
+<li><code>ms</code>: the number of milliseconds to pause. Allowed data types: <code>unsigned long</code>.</li>
+</ul>
+<h2>Returns</h2>
+<p>Nothing</p>
+<h2>Example Code</h2>
+<pre><code class="language-cpp">
+int ledPin = 13;                 // LED connected to digital pin 13
+
+void setup() {
+  pinMode(ledPin, OUTPUT);       // sets the digital pin as output
+}
+
+void loop() {
+  digitalWrite(ledPin, HIGH);    // sets the LED on
+  delay(1000);                   // waits for a second
+  digitalWrite(ledPin, LOW);     // sets the LED off
+  delay(1000);                   // waits for a second
+}
+</code></pre>
+<h2>Notes and Warnings</h2>
+<p>While it is easy to create a blinking LED with the <code>delay()</code> function, and many sketches use short delays for such tasks as switch debouncing, the use of <code>delay()</code> in a sketch has significant drawbacks. No other reading of sensors, mathematical calculations, or pin manipulation can go on during the delay function, so in effect, it brings most other activity to a halt.</p>
+<p>For alternative approaches using <code>millis()</code>, see the Blink Without Delay sketch.</p>
+<p>Certain things do go on while the <code>delay()</code> function is delaying the sketch, because the delay function does not disable interrupts. Serial communication that arrives while the delay is executing will still be received and stored in the serial receive buffer.</p>
+</article>
+</body>
+</html>

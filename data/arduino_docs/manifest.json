@@ -1,0 +1,13 @@
+{
+  "corpus": "arduino_language_reference_subset",
+  "description": "Offline sample of Arduino-like embedded language reference pages for Embeduino RAG demos.",
+  "documents": [
+    "digital_write.md",
+    "pin_mode.md",
+    "analog_read.md",
+    "serial_begin.md",
+    "millis.md",
+    "pwm_analog_write.md",
+    "delay.html"
+  ]
+}
