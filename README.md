@@ -2,7 +2,7 @@
 
 **Niche-docs RAG** for Arduino / embedded language-reference documentation.
 
-Part of Ayush Pandey’s GenAI portfolio: ingest a small offline docs corpus into a local vector store, retrieve with structure-aware chunks, and answer with **citations** — or an honest **“I don’t know”** when retrieval is weak.
+
 
 > Local-only demo. Do not push secrets; `.chroma/` and `.env` are gitignored.
 
