@@ -2,7 +2,7 @@
 
 **Niche-docs RAG** for Arduino / embedded language-reference documentation.
 
-
+Ingest a small offline docs corpus into a local vector store, retrieve with structure-aware chunks, and answer with **citations** — or an honest **“I don’t know”** when retrieval is weak.
 
 > Local-only demo. Do not push secrets; `.chroma/` and `.env` are gitignored.
 
@@ -10,7 +10,7 @@
 
 ## Problem
 
-Generic fixed-size chunking cuts through Arduino reference pages mid-section (e.g. splitting `## Syntax` from its code fence), which hurts retrieval precision for API-style docs. Portfolio RAG demos also often fail open: they invent answers when nothing relevant was retrieved.
+Generic fixed-size chunking cuts through Arduino reference pages mid-section (e.g. splitting `## Syntax` from its code fence), which hurts retrieval precision for API-style docs. Many RAG demos also fail open: they invent answers when nothing relevant was retrieved.
 
 ## Approach
 
