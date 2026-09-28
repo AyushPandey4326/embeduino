@@ -146,8 +146,11 @@ python3 -m embeduino ingest --reset
 # Ask with citations (local only)
 python3 -m embeduino ask "What does digitalWrite do?" --web off
 
-# Ask with web search (requires SERPAPI_API_KEY)
+# Ask with web search (requires SERPAPI_API_KEY in .env)
 python3 -m embeduino ask "What are the pin specifications for Arduino UNO R4 WiFi?" --web auto
+
+# Verbose mode (show INFO logs for debugging)
+python3 -m embeduino ask "..." --verbose
 
 # Golden Q&A smoke eval
 python3 -m embeduino eval --web off
@@ -309,6 +312,7 @@ Tests cover:
 3. **Honest refusal**: the weak-retrieval gate still fires after fusion, so some questions return "I don't know" even with web results
 4. **No real-time board/library detection**: trigger logic uses a static keyword list; new topics not in the list won't auto-trigger web search
 5. **Free tier limits**: 250 searches/month; exceed that and API calls fail
+6. **Windows encoding**: Run with `PYTHONUTF8=1` or `chcp 65001` to handle non-ASCII characters in web results
 
 ---
 
