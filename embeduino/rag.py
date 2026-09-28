@@ -8,7 +8,9 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Set
 
 from embeduino.config import Settings
+from embeduino.fusion import bm25_rank, reciprocal_rank_fusion
 from embeduino.store import VectorStore
+from embeduino.web_search import SerpApiSearcher, should_trigger_web_search
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +28,8 @@ class AskResult:
     citations: List[Dict[str, Any]] = field(default_factory=list)
     retrieved: List[Dict[str, Any]] = field(default_factory=list)
     weak_retrieval: bool = False
+    web_search_used: bool = False
+    web_credit_used: bool = False
 
 
 def _tokens(text: str) -> Set[str]:
@@ -141,6 +145,9 @@ def _build_citations(hits: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     cites = []
     for h in hits:
         meta = h.get("metadata") or {}
+        url = meta.get("url", "")
+        origin = "web" if meta.get("chunk_type") == "web" else "local"
+        
         cites.append(
             {
                 "id": h["id"],
@@ -148,6 +155,9 @@ def _build_citations(hits: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 "heading_path": meta.get("heading_path", ""),
                 "score": round(float(h.get("score", 0.0)), 4),
                 "rerank_score": round(float(h.get("rerank_score", h.get("score", 0.0))), 4),
+                "rrf_score": round(float(h.get("rrf_score", 0.0)), 4) if "rrf_score" in h else None,
+                "url": url,
+                "origin": origin,
                 "preview": (h.get("text") or "")[:200],
             }
         )
@@ -259,8 +269,13 @@ def _openai_answer(question: str, hits: List[Dict[str, Any]], settings: Settings
     context_blocks = []
     for h in hits:
         meta = h.get("metadata") or {}
+        label = f"[{h['id']}]"
+        if meta.get("chunk_type") == "web":
+            url = meta.get("url", "")
+            label = f"[{h['id']}] (web: {url})"
+        
         context_blocks.append(
-            f"[{h['id']}] source={meta.get('source')} heading={meta.get('heading_path')}\n"
+            f"{label} source={meta.get('source')} heading={meta.get('heading_path')}\n"
             f"{h.get('text', '')}"
         )
     context = "\n\n---\n\n".join(context_blocks)
@@ -282,21 +297,80 @@ def _openai_answer(question: str, hits: List[Dict[str, Any]], settings: Settings
     return (resp.choices[0].message.content or "").strip()
 
 
+def _validate_citations(answer: str, hits: List[Dict[str, Any]]) -> bool:
+    """Check that all cited chunk ids in answer exist in hits."""
+    cited_ids = set(re.findall(r"\[([^\]]+)\]", answer))
+    available_ids = {h["id"] for h in hits}
+    
+    invalid = cited_ids - available_ids
+    if invalid:
+        logger.warning("Invalid citations found: %s", invalid)
+        return False
+    return True
+
+
 def ask(
     question: str,
     store: VectorStore,
     settings: Settings,
+    web_mode_override: str | None = None,
 ) -> AskResult:
-    # Fetch a few extra neighbors for reranking
-    raw = store.query(question, top_k=max(settings.top_k * 3, 12))
-    hits = _rerank(question, raw)[: settings.top_k]
+    effective_web_mode = web_mode_override or settings.web_mode
+    
+    # 1. Vector retrieval
+    raw_vector = store.query(question, top_k=max(settings.top_k * 3, 12))
+    vector_ranked = _rerank(question, raw_vector)
+    
+    # 2. BM25 retrieval
+    all_chunks = store.get_all_chunks()
+    bm25_ranked = bm25_rank(question, all_chunks) if all_chunks else []
+    
+    # 3. Check if local retrieval is weak
+    local_weak = _is_weak(question, vector_ranked, settings.min_score)
+    
+    # 4. Decide whether to use web search
+    web_search_used = False
+    web_credit_used = False
+    web_hits = []
+    
+    trigger_web = should_trigger_web_search(
+        question, vector_ranked, local_weak, effective_web_mode
+    )
+    
+    if trigger_web and settings.serpapi_api_key:
+        searcher = SerpApiSearcher(
+            api_key=settings.serpapi_api_key,
+            cache_dir=settings.serp_cache,
+            max_calls_per_run=settings.serp_max_calls,
+        )
+        web_results, credit_used = searcher.search(
+            question,
+            trusted_sites=settings.web_sites,
+            num_results=settings.web_num,
+        )
+        web_hits = [w.to_dict() for w in web_results]
+        web_search_used = True
+        web_credit_used = credit_used
+        logger.info(
+            "Web search: %d results, credit_used=%s",
+            len(web_hits), credit_used
+        )
+    
+    # 5. Reciprocal Rank Fusion
+    ranked_lists = [vector_ranked, bm25_ranked]
+    if web_hits:
+        ranked_lists.append(web_hits)
+    
+    fused = reciprocal_rank_fusion(ranked_lists, k=settings.rrf_k)
+    hits = fused[: settings.top_k]
     _log_retrieved(hits)
-
+    
+    # 6. Post-fusion weak check
     weak = _is_weak(question, hits, settings.min_score)
-
+    
     if weak:
         logger.warning(
-            "Weak retrieval for %r (best score=%.3f lex=%.2f min=%.3f)",
+            "Weak retrieval after fusion for %r (best score=%.3f lex=%.2f min=%.3f)",
             question,
             hits[0]["score"] if hits else -1.0,
             hits[0].get("lex_overlap", 0.0) if hits else 0.0,
@@ -310,16 +384,26 @@ def ask(
             citations=_build_citations(hits[:2]),
             retrieved=hits,
             weak_retrieval=True,
+            web_search_used=web_search_used,
+            web_credit_used=web_credit_used,
         )
-
+    
+    # 7. Generate answer
     if settings.generation_backend == "openai":
         answer = _openai_answer(question, hits, settings)
+        
+        # 8. Validate citations for OpenAI answers
+        if not _validate_citations(answer, hits):
+            logger.warning("Citation validation failed, falling back to extractive")
+            answer = _extractive_answer(question, hits)
     else:
         answer = _extractive_answer(question, hits)
-
+    
     return AskResult(
         answer=answer,
         citations=_build_citations(hits),
         retrieved=hits,
         weak_retrieval=False,
+        web_search_used=web_search_used,
+        web_credit_used=web_credit_used,
     )

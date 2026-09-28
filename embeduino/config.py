@@ -27,6 +27,14 @@ class Settings:
     chroma_path: Path = PROJECT_ROOT / ".chroma"
     collection: str = "embeduino_docs"
     data_dir: Path = PROJECT_ROOT / "data" / "arduino_docs"
+    
+    serpapi_api_key: str = ""
+    web_mode: str = "auto"
+    web_num: int = 5
+    web_sites: list[str] = None
+    serp_cache: Path = PROJECT_ROOT / ".serp_cache"
+    serp_max_calls: int = 10
+    rrf_k: int = 60
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -34,6 +42,18 @@ class Settings:
         chroma_path = Path(chroma)
         if not chroma_path.is_absolute():
             chroma_path = PROJECT_ROOT / chroma_path
+        
+        serp_cache = os.getenv("EMBEDUINO_SERP_CACHE", ".serp_cache")
+        serp_cache_path = Path(serp_cache)
+        if not serp_cache_path.is_absolute():
+            serp_cache_path = PROJECT_ROOT / serp_cache_path
+        
+        web_sites_str = os.getenv(
+            "EMBEDUINO_WEB_SITES",
+            "docs.arduino.cc github.com forum.arduino.cc"
+        )
+        web_sites = [s.strip() for s in web_sites_str.split() if s.strip()]
+        
         return cls(
             embedding_backend=os.getenv("EMBEDUINO_EMBEDDING_BACKEND", "local").lower(),
             local_model=os.getenv(
@@ -50,6 +70,13 @@ class Settings:
             chroma_path=chroma_path,
             collection=os.getenv("EMBEDUINO_COLLECTION", "embeduino_docs"),
             data_dir=PROJECT_ROOT / "data" / "arduino_docs",
+            serpapi_api_key=os.getenv("SERPAPI_API_KEY", ""),
+            web_mode=os.getenv("EMBEDUINO_WEB_MODE", "auto").lower(),
+            web_num=int(os.getenv("EMBEDUINO_WEB_NUM", "5")),
+            web_sites=web_sites,
+            serp_cache=serp_cache_path,
+            serp_max_calls=int(os.getenv("EMBEDUINO_SERP_MAX_CALLS", "10")),
+            rrf_k=int(os.getenv("EMBEDUINO_RRF_K", "60")),
         )
 
 
