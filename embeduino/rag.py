@@ -297,11 +297,18 @@ def _extractive_answer(question: str, hits: List[Dict[str, Any]]) -> str:
             para = para.strip()
             if not para or (re.match(r"^#{1,6}\s+", para) and len(para) < 60):
                 continue
-            # Split on sentence boundaries
-            for sent in re.split(r'[.!?]\s+', para):
-                sent = sent.strip()
-                if len(sent) > 30:  # Min sentence length
-                    sentences.append(sent)
+            
+            # Check if this is a "Section - Key: Value" spec block (Gatsby page-data)
+            # Lines like "Pins - Digital I/O Pins: 14" should each be a sentence
+            if re.match(r'^[A-Z][a-zA-Z\s]+ - [^:]+:\s*.+$', para):
+                # Spec line, treat as single sentence
+                sentences.append(para)
+            else:
+                # Split on sentence boundaries
+                for sent in re.split(r'[.!?]\s+', para):
+                    sent = sent.strip()
+                    if len(sent) > 30:  # Min sentence length
+                        sentences.append(sent)
         
         if not sentences:
             return text[:700]
@@ -313,11 +320,20 @@ def _extractive_answer(question: str, hits: List[Dict[str, Any]]) -> str:
             sent_terms = _tokens(sent)
             if sent_terms:
                 overlap = len(q_terms & sent_terms) / len(q_terms) if q_terms else 0
-                scored.append((overlap, sent))
+                
+                # Boost spec lines for pin/power/communication questions
+                boost = 0.0
+                if re.match(r'^(Pins|Power|Communication|Memory|Clock) - ', sent):
+                    # Check if question is about specs
+                    spec_keywords = {'pin', 'voltage', 'current', 'power', 'specification', 'spec', 'communication', 'uart', 'i2c', 'spi'}
+                    if any(kw in question.lower() for kw in spec_keywords):
+                        boost = 0.3
+                
+                scored.append((overlap + boost, sent))
         
         # Sort by overlap, take top 3-6
         scored.sort(key=lambda x: -x[0])
-        top_sentences = [s for _, s in scored[:6] if _>0.1]  # Only if some overlap
+        top_sentences = [s for _, s in scored[:6] if _>0.05]  # Lower threshold for spec lines
         
         if not top_sentences:
             # Fallback to first few sentences

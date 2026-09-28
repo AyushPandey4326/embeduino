@@ -96,20 +96,31 @@ class SerpApiSearcher:
             return False
     
     def _fetch_page(self, url: str) -> Optional[str]:
-        """Fetch and extract main text from a web page, stripping chrome/nav/UI."""
-        # Check cache first
+        """Fetch and extract main text from a web page, with Gatsby page-data.json support."""
         url_hash = hashlib.sha1(url.encode()).hexdigest()[:16]
         cache_file = self.page_cache_dir / f"{url_hash}.txt"
         
+        # Special handling for docs.arduino.cc Gatsby pages (check BEFORE cache)
+        if "docs.arduino.cc/hardware/" in url:
+            content = self._fetch_gatsby_page_data(url)
+            if content:
+                try:
+                    cache_file.write_text(content, encoding="utf-8")
+                except Exception as e:
+                    logger.warning("Page cache write error for %s: %s", url, e)
+                return content
+            # If Gatsby fetch fails, fall through to HTML fetch with cache
+        
+        # Check cache for non-Gatsby or failed Gatsby pages
         if cache_file.exists():
             try:
                 return cache_file.read_text(encoding="utf-8")
             except Exception as e:
                 logger.warning("Page cache read error for %s: %s", url, e)
         
-        # Fetch page
+        # Fallback to HTML fetch
         try:
-            logger.debug("Fetching page: %s", url)
+            logger.debug("Fetching HTML page: %s", url)
             resp = httpx.get(
                 url,
                 headers={"User-Agent": "Mozilla/5.0 (compatible; EmbeduinoBot/1.0)"},
@@ -133,16 +144,16 @@ class SerpApiSearcher:
             # Remove non-content elements (aggressive for GitHub/Discourse)
             for tag in soup([
                 "script", "style", "nav", "footer", "header", "aside", "iframe", "noscript",
-                "button",  # GitHub buttons (Fork, Star, etc.)
+                "button",  # GitHub buttons
             ]):
                 tag.decompose()
             
-            # Remove by class/id patterns (GitHub/Discourse UI)
+            # Remove by class/id patterns
             ui_patterns = [
                 "sign-in", "signin", "notification", "subscribe", "login",
                 "avatar", "timestamp", "username", "reply", "comment-meta",
                 "sidebar", "menu", "breadcrumb", "pagination",
-                "fork", "star", "watch", "sponsor",  # GitHub actions
+                "fork", "star", "watch", "sponsor",
                 "header", "footer", "navbar",
             ]
             
@@ -152,7 +163,7 @@ class SerpApiSearcher:
                 for tag in soup.find_all(id=lambda x: x and pattern in x.lower()):
                     tag.decompose()
             
-            # Get main content (try common content containers first)
+            # Get main content
             main_content = soup.find("main") or soup.find("article") or soup.find("div", class_=re.compile(r"content|main|article|body", re.I))
             
             if main_content:
@@ -190,6 +201,86 @@ class SerpApiSearcher:
             
         except Exception as e:
             logger.warning("Failed to fetch %s: %s", url, e)
+            return None
+    
+    def _fetch_gatsby_page_data(self, url: str) -> Optional[str]:
+        """
+        Fetch page-data.json for Gatsby sites (docs.arduino.cc).
+        
+        Extracts techspecs from result.data.techspecs.fields.content
+        and converts YAML-like structure to readable "Section - Key: Value" lines.
+        """
+        try:
+            # Extract slug from URL: docs.arduino.cc/hardware/uno-r4-wifi/ → uno-r4-wifi
+            parsed = urlparse(url)
+            path = parsed.path.rstrip('/')
+            # Remove /hardware/ prefix
+            if '/hardware/' in path:
+                slug = path.split('/hardware/')[-1]
+            else:
+                return None
+            
+            page_data_url = f"https://docs.arduino.cc/page-data/hardware/{slug}/page-data.json"
+            
+            logger.debug("Fetching Gatsby page-data: %s", page_data_url)
+            resp = httpx.get(
+                page_data_url,
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=10.0,
+            )
+            resp.raise_for_status()
+            
+            data = resp.json()
+            result_data = data.get("result", {}).get("data", {})
+            
+            # Extract overview/description
+            product = result_data.get("product", {})
+            child_mdx = product.get("childMdx", {})
+            excerpt = child_mdx.get("excerpt", "")
+            
+            # Extract techspecs
+            techspecs = result_data.get("techspecs", {})
+            techspecs_content = techspecs.get("fields", {}).get("content", "")
+            
+            if not techspecs_content:
+                logger.warning("No techspecs found in page-data for %s", url)
+                return None
+            
+            # Parse YAML-like techspecs into "Section - Key: Value" lines
+            lines = []
+            if excerpt:
+                lines.append(excerpt)
+                lines.append("")
+            
+            current_section = ""
+            for line in techspecs_content.split("\n"):
+                line = line.rstrip()
+                if not line:
+                    continue
+                
+                # Section header (no leading spaces, ends with :)
+                if not line.startswith(" ") and line.endswith(":"):
+                    current_section = line.rstrip(":")
+                # Key-value pair (leading spaces)
+                elif line.startswith(" ") and ":" in line:
+                    # Parse "  Key: Value"
+                    key_value = line.strip()
+                    if ":" in key_value:
+                        key, value = key_value.split(":", 1)
+                        key = key.strip()
+                        value = value.strip()
+                        # Make self-contained: "Section - Key: Value"
+                        if current_section:
+                            lines.append(f"{current_section} - {key}: {value}")
+                        else:
+                            lines.append(f"{key}: {value}")
+            
+            content = "\n".join(lines)
+            logger.info("Fetched %d chars from Gatsby page-data for %s", len(content), url)
+            return content
+            
+        except Exception as e:
+            logger.warning("Failed to fetch Gatsby page-data for %s: %s", url, e)
             return None
     
     def _chunk_page_content(self, content: str, url: str, title: str, max_chunk_size: int = 800, min_chunk_size: int = 150) -> List[str]:

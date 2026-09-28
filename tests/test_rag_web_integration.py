@@ -336,3 +336,99 @@ def test_zero_web_results_handled_gracefully(mock_local_chunks, mock_settings, m
     # All citations should be local
     web_citations = [c for c in result.citations if c["origin"] == "web"]
     assert len(web_citations) == 0, "Should have no web citations when 0 web results"
+
+
+def test_gatsby_page_data_extraction_with_fixture(mock_local_chunks, mock_settings, monkeypatch):
+    """
+    Test that Gatsby page-data.json extraction works for docs.arduino.cc hardware pages.
+    
+    This ensures:
+    1. Page-data.json is fetched and parsed correctly
+    2. Tech specs are converted to "Section - Key: Value" format
+    3. Pin specifications (14 digital I/O, 6 PWM, 8 mA) are included in answer
+    4. docs.arduino.cc URL is cited
+    """
+    question = "What are the pin specifications for Arduino UNO R4 WiFi?"
+    
+    # Load page-data fixture
+    fixture_path = Path(__file__).parent / "fixtures" / "uno_r4_wifi_page_data.json"
+    page_data_fixture = json.loads(fixture_path.read_text())
+    
+    # Mock httpx to return page-data fixture
+    def mock_httpx_get(url, **kwargs):
+        mock_resp = MagicMock()
+        if "page-data.json" in url:
+            mock_resp.json.return_value = page_data_fixture
+            mock_resp.raise_for_status = lambda: None
+        else:
+            mock_resp.raise_for_status.side_effect = Exception("Not found")
+        return mock_resp
+    
+    monkeypatch.setattr("embeduino.web_search.httpx.get", mock_httpx_get)
+    
+    # Create searcher and test _fetch_gatsby_page_data directly
+    from embeduino.web_search import SerpApiSearcher
+    import tempfile
+    
+    searcher = SerpApiSearcher(
+        api_key="test",
+        cache_dir=Path(tempfile.mkdtemp()),
+        max_calls_per_run=10,
+        timeout_s=90,
+    )
+    
+    # Test extraction
+    content = searcher._fetch_gatsby_page_data("https://docs.arduino.cc/hardware/uno-r4-wifi/")
+    assert content is not None, "Should extract content from page-data.json"
+    assert "Pins - Digital I/O Pins: 14" in content, "Should have formatted pin spec"
+    assert "Pins - PWM pins: 6" in content, "Should have PWM pin count"
+    assert "Power - DC Current per I/O Pin: 8 mA" in content, "Should have current spec"
+    assert "Pins - Analog input pins: 6" in content, "Should have analog input count"
+    assert "Pins - DAC: 1" in content, "Should have DAC count"
+    assert "Power - Circuit operating voltage: 5 V" in content, "Should have voltage spec"
+    assert "Power - Input voltage (VIN): 6-24 V" in content, "Should have VIN range"
+    
+    # Now test full pipeline with mocked SerpApi returning the hardware URL
+    mock_store = MagicMock()
+    mock_store.query.return_value = mock_local_chunks
+    mock_store.get_all_chunks.return_value = mock_local_chunks
+    
+    # Create a web hit for the hardware page
+    from embeduino.web_search import WebHit
+    
+    web_hit = WebHit(
+        id="web_uno_r4_wifi_page_data",
+        text=content,  # Use extracted Gatsby content
+        url="https://docs.arduino.cc/hardware/uno-r4-wifi/",
+        title="Arduino UNO R4 WiFi",
+        position=1,
+        snippet="Arduino UNO R4 WiFi specifications and pinout.",
+        fetched_content=content,
+    )
+    
+    with patch("embeduino.rag.SerpApiSearcher") as mock_searcher_class:
+        mock_searcher = MagicMock()
+        mock_searcher.search.return_value = (
+            [web_hit],
+            1,  # credits_used
+            "api_success"
+        )
+        mock_searcher._compute_score = lambda q, t, u="": 0.7
+        mock_searcher_class.return_value = mock_searcher
+        
+        result = ask(question, mock_store, mock_settings, web_mode_override="always")
+    
+    # Verify answer contains key pin specifications
+    answer_lower = result.answer.lower()
+    assert "14" in result.answer, "Answer should mention 14 digital I/O pins"
+    assert "6" in result.answer, "Answer should mention 6 PWM pins or 6 analog inputs"
+    assert "8 ma" in answer_lower or "8ma" in answer_lower, "Answer should mention 8 mA current"
+    
+    # Verify docs.arduino.cc is cited
+    web_citations = [c for c in result.citations if c["origin"] == "web"]
+    assert len(web_citations) >= 1, "Should have at least one web citation"
+    assert any("docs.arduino.cc" in c["url"] for c in web_citations), "Should cite docs.arduino.cc"
+    
+    # Verify answer is substantive (not empty or "I don't know")
+    assert len(result.answer) > 200, f"Answer should be substantive, got {len(result.answer)} chars"
+    assert "I don't know" not in result.answer, "Answer should not be 'I don't know'"
