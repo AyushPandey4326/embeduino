@@ -34,6 +34,7 @@ class Settings:
     web_sites: list[str] = None
     serp_cache: Path = PROJECT_ROOT / ".serp_cache"
     serp_max_calls: int = 10
+    serp_timeout_s: int = 90
     rrf_k: int = 60
 
     @classmethod
@@ -76,6 +77,7 @@ class Settings:
             web_sites=web_sites,
             serp_cache=serp_cache_path,
             serp_max_calls=int(os.getenv("EMBEDUINO_SERP_MAX_CALLS", "10")),
+            serp_timeout_s=int(os.getenv("SERPAPI_TIMEOUT_S", "90")),
             rrf_k=int(os.getenv("EMBEDUINO_RRF_K", "60")),
         )
 

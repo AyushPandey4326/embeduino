@@ -353,6 +353,7 @@ def ask(
             api_key=settings.serpapi_api_key,
             cache_dir=settings.serp_cache,
             max_calls_per_run=settings.serp_max_calls,
+            timeout_s=settings.serp_timeout_s,
         )
         web_results, credit_used, status = searcher.search(
             question,

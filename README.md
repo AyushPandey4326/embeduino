@@ -36,9 +36,12 @@ The local corpus is 8 reference pages covering core Arduino functions (digitalWr
 ### Engine and Query
 
 - **Engine**: Google Search API (`https://serpapi.com/search?engine=google`)
-- **Query shape**: `"<question> (site:docs.arduino.cc OR site:github.com OR site:forum.arduino.cc)"`
-- **Parameters**: `hl=en`, `gl=us`, `num=5` (configurable)
+- **Async mode**: Uses `async=true` to initiate search, then polls `https://serpapi.com/searches/{id}.json` every 2.5s until `status=Success` (polling does not cost credits)
+- **Query shape**: Keywords extracted from question + `site:docs.arduino.cc` (prefer docs first, fallback to no filter if 0 results)
+- **Example**: `"pin specifications arduino uno R4 wifi site:docs.arduino.cc"`
+- **Parameters**: `hl=en`, `gl=us` (no `num` parameter; results sliced locally)
 - **Fields used**: `organic_results[].position`, `.title`, `.link`, `.snippet`
+- **Timeout**: Configurable via `SERPAPI_TIMEOUT_S` (default 90s, includes polling time)
 
 ### Trigger Logic
 

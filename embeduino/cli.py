@@ -159,8 +159,10 @@ def ask_cmd(
             console.print("[green]Web search served from cache (0 SerpApi credits)[/]")
         elif result.web_status == "api_success" and result.web_credit_used:
             console.print("[yellow]Web search used (1 SerpApi credit)[/]")
+        elif result.web_status == "timeout":
+            console.print("[red]Web search timed out (took >90s, 1 credit used)[/]")
         elif result.web_status == "api_failed":
-            console.print("[red]Web search failed (network error)[/]")
+            console.print("[red]Web search failed (error)[/]")
         elif result.web_status == "no_key":
             console.print("[dim]Web search skipped (no API key)[/]")
         elif result.web_status == "max_calls":
