@@ -12,6 +12,23 @@ Ingest a small offline docs corpus into a local vector store, retrieve with stru
 
 **This project existed before September 1, 2026.** The following features were added specifically for the [SerpApi India Hackathon 2026](https://serpapi.github.io/serpapi-india-hackathon-2026/):
 
+### 🔥 Latest: Fixed RRF Structural Bias (Critical)
+
+**Third Windows 11 real-key test** showed async mode working (9.8s, "Searching the web..." displayed, 1 credit used), but **answer was still "I don't know" with zero web chunks in citations**. Top 4 retrieved were all local (analog_read, digital_write, pin_mode, pwm_analog_write) each with RRF score ~0.032.
+
+**Root Cause**: Local chunks appeared in **BOTH** `vector_ranked` and `bm25_ranked` lists → combined RRF ≈ 2/(k+rank) ≈ 0.032. Web chunks appeared in **ONLY** `web_ranked` → max RRF = 1/(k+1) ≈ 0.016. With `top_k=4`, web chunks could **never** compete.
+
+**Fix**: Score web chunks through the same rankers:
+1. Combine local+web **before** reranking → web chunks appear in `vector_ranked`
+2. Add web chunks to BM25 corpus → web chunks appear in `bm25_ranked`
+3. RRF now sees web in both lists → fair 2× multiplier for all
+
+**Result**: Web chunks now earn competitive RRF scores (>0.025 typical), reach citations, extractive answers use web as primary with URLs.
+
+**Validation**: 5 new integration tests (31 total pass) with realistic local+web fusion paths.
+
+---
+
 ### Live Web Search Integration
 
 The offline corpus goes stale as new Arduino boards, libraries, and core versions are released. Questions about topics not in the local documentation now trigger a **live SerpApi Google Search** restricted to trusted embedded sources (docs.arduino.cc, github.com, forum.arduino.cc).
@@ -59,13 +76,14 @@ Web search is triggered when:
 
 ### Fusion
 
-**Reciprocal Rank Fusion (RRF)** merges three ranked lists:
+**Reciprocal Rank Fusion (RRF)** merges ranked lists with fair scoring:
 
-1. **Vector search**: cosine similarity + heuristic reranking
-2. **BM25**: keyword-based retrieval over local chunks
-3. **Web search**: SerpApi results (when triggered)
+1. **Vector search**: Raw vector results + web chunks combined, then reranked with lexical overlap and heading boosts
+2. **BM25**: Keyword retrieval over local chunks + web chunks combined
 
-RRF score for each item: `sum over lists of 1/(k + rank_in_list)`, where `k=60` (configurable). The top-k fused results are used for answer generation.
+**Key**: Web chunks are scored through **both** rankers (not isolated in a third list), ensuring fair competition. Both local and web chunks appear in both lists → equal 2× RRF multiplier.
+
+RRF score: `sum over lists of 1/(k + rank_in_list)`, where `k=60` (configurable). Top-k fused results used for generation.
 
 ### Citation and Honesty
 
@@ -242,7 +260,10 @@ embeduino/
 ├── tests/
 │   ├── test_chunker.py
 │   ├── test_fusion.py     # BM25 + RRF tests
-│   └── test_web_search.py # SerpApi parsing, caching, trigger tests
+│   ├── test_web_search.py # SerpApi parsing, caching, trigger tests
+│   ├── test_rag_web_integration.py # 5 integration tests: realistic local+web fusion
+│   └── fixtures/
+│       └── serpapi_uno_r4_response.json
 ├── docs/demo.md           # 3-minute demo script
 ├── .env.example
 ├── LICENSE                # MIT
