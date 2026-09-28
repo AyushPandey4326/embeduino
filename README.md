@@ -1,85 +1,221 @@
 # Embeduino
 
-**Niche-docs RAG** for Arduino / embedded language-reference documentation.
+**Niche-docs RAG** for Arduino / embedded language-reference documentation with live web search.
 
-Ingest a small offline docs corpus into a local vector store, retrieve with structure-aware chunks, and answer with **citations** — or an honest **“I don’t know”** when retrieval is weak.
+Ingest a small offline docs corpus into a local vector store, retrieve with structure-aware chunks using hybrid search (vector + BM25), and answer with **citations** — or an honest **"I don't know"** when retrieval is weak. When local documentation doesn't cover a topic, Embeduino can search trusted web sources in real-time to stay current.
 
-> Local-only demo. Do not push secrets; `.chroma/` and `.env` are gitignored.
+> Local-only demo. Do not push secrets; `.chroma/`, `.serp_cache/` and `.env` are gitignored.
+
+---
+
+## What's New: SerpApi Hackathon 2026 Enhancements
+
+**This project existed before September 1, 2026.** The following features were added specifically for the [SerpApi India Hackathon 2026](https://serpapi.github.io/serpapi-india-hackathon-2026/):
+
+### Live Web Search Integration
+
+The offline corpus goes stale as new Arduino boards, libraries, and core versions are released. Questions about topics not in the local documentation now trigger a **live SerpApi Google Search** restricted to trusted embedded sources (docs.arduino.cc, github.com, forum.arduino.cc).
+
+- **BM25 keyword retrieval** over local chunks alongside vector search
+- **Reciprocal Rank Fusion (RRF)** merges vector, BM25, and web results into a single ranked list
+- **SerpApi Google Search** provides live results as retrievable chunks with URL citations
+- **Smart triggering**: web search fires automatically when local retrieval is weak OR when the question mentions boards/libraries/versions not in the local corpus
+- **Credit safety**: on-disk cache (gitignored), per-run call cap, clear output showing whether a SerpApi credit was used
+- **Citation grounding**: OpenAI-generated answers validate that every cited chunk ID exists in the context
+
+### Why Live Search?
+
+The local corpus is 8 reference pages covering core Arduino functions (digitalWrite, pinMode, analogRead, etc.). Newer boards like the **Arduino UNO R4 WiFi**, **Nano ESP32**, or **Nano 33 BLE Sense** aren't documented locally. Without SerpApi, those questions fail with "I don't know". With SerpApi, Embeduino retrieves current information from trusted sources, fuses it with local results, and provides grounded answers with web citations.
+
+**SerpApi is a genuine, central part of the pipeline** — not a cosmetic call. The system depends on live search data to answer questions the local corpus cannot cover.
+
+---
+
+## How SerpApi Is Used
+
+### Engine and Query
+
+- **Engine**: Google Search API (`https://serpapi.com/search?engine=google`)
+- **Query shape**: `"<question> (site:docs.arduino.cc OR site:github.com OR site:forum.arduino.cc)"`
+- **Parameters**: `hl=en`, `gl=us`, `num=5` (configurable)
+- **Fields used**: `organic_results[].position`, `.title`, `.link`, `.snippet`
+
+### Trigger Logic
+
+Web search is triggered when:
+
+1. **Mode is "always"**: every question uses web search
+2. **Mode is "auto"** (default): search fires if local retrieval is weak OR the question mentions a board, library, or version not in the local corpus (e.g., "UNO R4", "ESP32", "Nano 33", "library")
+3. **Mode is "off"**: web search is disabled
+
+### Result Processing
+
+1. SerpApi returns up to `EMBEDUINO_WEB_NUM` organic results
+2. Each result becomes a retrievable chunk: `snippet` as text, `link` as URL, `title` as heading
+3. Web chunks are labeled `chunk_type="web"` and carry `url` metadata
+
+### Fusion
+
+**Reciprocal Rank Fusion (RRF)** merges three ranked lists:
+
+1. **Vector search**: cosine similarity + heuristic reranking
+2. **BM25**: keyword-based retrieval over local chunks
+3. **Web search**: SerpApi results (when triggered)
+
+RRF score for each item: `sum over lists of 1/(k + rank_in_list)`, where `k=60` (configurable). The top-k fused results are used for answer generation.
+
+### Citation and Honesty
+
+- After fusion, the weak-retrieval gate still applies: if confidence is too low, return "I don't know"
+- OpenAI-generated answers validate that every cited chunk ID exists in the provided context; if validation fails, fall back to extractive answers
+- Citations include `origin` (local/web) and `url` for web chunks
+
+---
+
+## Architecture
+
+```
+┌───────────────────────────────────────────────────────────────┐
+│                        User Question                          │
+└───────────────┬───────────────────────────────────────────────┘
+                │
+        ┌───────▼────────┐
+        │   Embeddings   │
+        └────────┬───────┘
+                 │
+      ┌──────────▼───────────┐
+      │  Parallel Retrieval  │
+      ├──────────────────────┤
+      │ • Vector (Chroma)    │
+      │ • BM25 (local)       │
+      │ • Web (SerpApi*)     │ * if triggered
+      └──────────┬───────────┘
+                 │
+        ┌────────▼──────────┐
+        │  RRF Fusion       │
+        │  (k=60, top-k=4)  │
+        └────────┬──────────┘
+                 │
+       ┌─────────▼──────────┐
+       │  Weak Gate         │
+       │  (honesty check)   │
+       └─────────┬──────────┘
+                 │
+        ┌────────▼──────────┐
+        │  Answer Generation│
+        │  + Citation Check │
+        └────────┬──────────┘
+                 │
+         ┌───────▼────────┐
+         │  Answer + URLs │
+         └────────────────┘
+```
 
 ---
 
 ## Problem
 
-Generic fixed-size chunking cuts through Arduino reference pages mid-section (e.g. splitting `## Syntax` from its code fence), which hurts retrieval precision for API-style docs. Many RAG demos also fail open: they invent answers when nothing relevant was retrieved.
+Generic fixed-size chunking cuts through Arduino reference pages mid-section (e.g. splitting `## Syntax` from its code fence), which hurts retrieval precision for API-style docs. Many RAG demos also fail open: they invent answers when nothing relevant was retrieved. Additionally, offline-only systems go stale as new hardware and libraries are released.
 
 ## Approach
 
-1. **Offline-first corpus** under `data/arduino_docs/` (markdown + one HTML page) so ingest works without scraping.
-2. **Structure-aware chunking**: split on headings, keep fenced code as dedicated chunks, small word overlap between oversized prose splits. Optional **fixed-size** baseline for comparison (`--strategy fixed`).
-3. **Local embeddings** via `sentence-transformers` (`all-MiniLM-L6-v2`); OpenAI embeddings/chat via `.env` if desired.
-4. **Chroma** persistence under `.chroma/`.
-5. **Weak-retrieval gate**: if top similarity &lt; `EMBEDUINO_MIN_SCORE`, refuse with “I don’t know”.
-6. **Logging** of retrieved chunk ids, scores, and previews on every `ask`.
+1. **Offline-first corpus** under `data/arduino_docs/` (markdown + one HTML page) so ingest works without scraping
+2. **Structure-aware chunking**: split on headings, keep fenced code as dedicated chunks, small word overlap between oversized prose splits. Optional **fixed-size** baseline for comparison (`--strategy fixed`)
+3. **Hybrid retrieval**:
+   - **Local embeddings** via `sentence-transformers` (`all-MiniLM-L6-v2`); OpenAI embeddings/chat via `.env` if desired
+   - **BM25** keyword search over local chunks
+   - **Live web search** via SerpApi when local results are insufficient
+4. **Chroma** persistence under `.chroma/`
+5. **Reciprocal Rank Fusion** merges vector, BM25, and web results
+6. **Weak-retrieval gate**: if top similarity < `EMBEDUINO_MIN_SCORE` after fusion, refuse with "I don't know"
+7. **Logging** of retrieved chunk ids, scores, and previews on every `ask`
+
+---
 
 ## Demo
 
 ```bash
-cd /workspace/embeduino
-python -m venv .venv
+cd /workspace
+python3 -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"
 
 # Ingest sample corpus (structure-aware)
-python -m embeduino ingest --reset
+python3 -m embeduino ingest --reset
 
-# Ask with citations
-python -m embeduino ask "What does digitalWrite do?"
+# Ask with citations (local only)
+python3 -m embeduino ask "What does digitalWrite do?" --web off
+
+# Ask with web search (requires SERPAPI_API_KEY)
+python3 -m embeduino ask "What are the pin specifications for Arduino UNO R4 WiFi?" --web auto
 
 # Golden Q&A smoke eval
-python -m embeduino eval
+python3 -m embeduino eval --web off
 ```
 
 Optional live fetch (network-dependent; offline corpus is enough):
 
 ```bash
-python -m embeduino ingest --reset --fetch
+python3 -m embeduino ingest --reset --fetch
 ```
 
 Compare chunkers:
 
 ```bash
-python -m embeduino ingest --reset --strategy structure
-python -m embeduino ingest --reset --strategy fixed
+python3 -m embeduino ingest --reset --strategy structure
+python3 -m embeduino ingest --reset --strategy fixed
 ```
+
+---
 
 ## Install
 
 Requirements: Python 3.10+, ~1GB disk for the embedding model on first run.
 
 ```bash
-cd /workspace/embeduino
-python -m venv .venv && source .venv/bin/activate
+cd /workspace
+python3 -m venv .venv && source .venv/bin/activate
 pip install -U pip
 pip install -e ".[dev]"
 # or: pip install -r requirements.txt && pip install -e .
-cp .env.example .env   # edit only if using OpenAI
+cp .env.example .env
+# Edit .env: add your SERPAPI_API_KEY (free tier: 250 searches/month)
 ```
 
-### Configuration (`.env`)
+### Get a Free SerpApi Key
+
+1. Sign up at [https://serpapi.com/](https://serpapi.com/)
+2. Get 250 free searches per month (no credit card required)
+3. Copy your API key to `.env`: `SERPAPI_API_KEY=your_key_here`
+
+---
+
+## Configuration
+
+Edit `.env` or set environment variables:
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
-| `EMBEDUINO_EMBEDDING_BACKEND` | `local` | `local` or `openai` |
+| `EMBEDUINO_EMBEDDING_BACKEND` | `local` | `local` (sentence-transformers) or `openai` |
 | `EMBEDUINO_LOCAL_MODEL` | `all-MiniLM-L6-v2` | sentence-transformers model |
 | `OPENAI_API_KEY` | _(empty)_ | Required for OpenAI embed/gen |
 | `EMBEDUINO_GENERATION_BACKEND` | `local` | `local` (extractive) or `openai` |
-| `EMBEDUINO_TOP_K` | `4` | Retrieved neighbors |
+| `EMBEDUINO_TOP_K` | `4` | Retrieved neighbors after fusion |
 | `EMBEDUINO_MIN_SCORE` | `0.30` | Cosine-similarity floor |
 | `EMBEDUINO_CHROMA_PATH` | `.chroma` | Persist directory |
+| **`SERPAPI_API_KEY`** | _(empty)_ | **SerpApi key (required for web search)** |
+| **`EMBEDUINO_WEB_MODE`** | **`auto`** | **Web search mode: `auto`, `always`, `off`** |
+| **`EMBEDUINO_WEB_NUM`** | **`5`** | **Number of SerpApi organic results** |
+| **`EMBEDUINO_WEB_SITES`** | **`docs.arduino.cc github.com forum.arduino.cc`** | **Trusted sites (space-separated)** |
+| **`EMBEDUINO_SERP_CACHE`** | **`.serp_cache`** | **On-disk cache directory (gitignored)** |
+| **`EMBEDUINO_SERP_MAX_CALLS`** | **`10`** | **Max SerpApi calls per run (credit cap)** |
+| **`EMBEDUINO_RRF_K`** | **`60`** | **Reciprocal Rank Fusion k parameter** |
 
-Never commit `.env` or API keys.
+Never commit `.env`, API keys, or cache directories.
 
-## Project layout
+---
+
+## Project Layout
 
 ```
 embeduino/
@@ -88,27 +224,97 @@ embeduino/
 │   ├── chunker.py         # structure-aware + fixed-size
 │   ├── loader.py          # local + optional docs.arduino.cc fetch
 │   ├── embeddings.py      # local / OpenAI
-│   ├── store.py           # Chroma wrapper
-│   ├── rag.py             # ask + weak-retrieval gate
+│   ├── store.py           # Chroma wrapper + BM25 chunk retrieval
+│   ├── fusion.py          # BM25 + RRF
+│   ├── web_search.py      # SerpApi client + caching + trigger logic
+│   ├── rag.py             # ask + weak-retrieval gate + citation validation
 │   └── cli.py             # ingest / ask / eval
 ├── scripts/golden_qa.jsonl
-├── tests/test_chunker.py
+├── tests/
+│   ├── test_chunker.py
+│   ├── test_fusion.py     # BM25 + RRF tests
+│   └── test_web_search.py # SerpApi parsing, caching, trigger tests
+├── docs/demo.md           # 3-minute demo script
 ├── .env.example
 ├── LICENSE                # MIT
 └── pyproject.toml
 ```
 
-## Eval
+---
 
-Minimal golden set in `scripts/golden_qa.jsonl` (known API facts + one out-of-domain “don’t know” case):
+## SerpApi Credit Usage
+
+### Free Tier
+
+- **250 searches/month** on the free plan (no credit card)
+- Cached searches (same query + params within 1 hour) are free via SerpApi's built-in cache
+- Embeduino's on-disk cache (`.serp_cache/`) makes repeats free forever
+
+### Credit Safety
+
+1. **On-disk cache**: every SerpApi response is saved locally; repeat queries never hit the API
+2. **Per-run max-calls cap** (`EMBEDUINO_SERP_MAX_CALLS=10`): prevents runaway loops
+3. **Clear CLI output**: shows "Web search used (1 SerpApi credit)" or "served from cache (0 credits)"
+
+### Typical Usage
+
+- **Development**: ~60 calls (mostly cached after first run)
+- **Eval runs**: ~25 calls (cached after first)
+- **Demo rehearsals**: ~15 calls (cached)
+- **Buffer**: ~150 calls
+
+Well within the 250/month free tier.
+
+---
+
+## Eval and Tests
+
+### Golden Q&A
+
+Minimal golden set in `scripts/golden_qa.jsonl` (known API facts + one out-of-domain "don't know" case + web-requiring questions):
 
 ```bash
-python -m embeduino ingest --reset
-python -m embeduino eval
-pytest -q
+python3 -m embeduino ingest --reset
+python3 -m embeduino eval --web off   # local questions only
+python3 -m embeduino eval --web auto  # includes web questions (uses credits)
 ```
 
-Expected: most factual questions pass via retrieved text; the flux-capacitor question should trigger weak retrieval / “I don’t know”.
+Expected: most factual questions pass via retrieved text; the flux-capacitor question should trigger weak retrieval / "I don't know"; web questions require SerpApi.
+
+### Unit Tests
+
+All tests use fixtures and mocks; **pytest never needs a SerpApi key or network access**:
+
+```bash
+export PATH="/home/ubuntu/.local/bin:$PATH"  # if pytest is in ~/.local/bin
+python3 -m pytest tests/ -v
+```
+
+Tests cover:
+- Structure-aware chunking
+- BM25 ranking
+- Reciprocal Rank Fusion
+- SerpApi result parsing (using saved JSON fixture)
+- Cache read/write
+- Web search trigger logic
+
+---
+
+## Limitations
+
+1. **Web snippets can be incomplete or misleading**: the system only has snippet text unless full page fetch is added
+2. **Trusted-site filter**: restricts results to configured domains; may miss relevant content elsewhere
+3. **Honest refusal**: the weak-retrieval gate still fires after fusion, so some questions return "I don't know" even with web results
+4. **No real-time board/library detection**: trigger logic uses a static keyword list; new topics not in the list won't auto-trigger web search
+5. **Free tier limits**: 250 searches/month; exceed that and API calls fail
+
+---
+
+## AI Tools Used
+
+This hackathon work was built with **AI coding assistance** (Cursor). All code, tests, and documentation were developed collaboratively with AI support.
+
+---
 
 ## License
 
