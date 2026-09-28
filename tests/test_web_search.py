@@ -416,3 +416,210 @@ def test_api_failure_status(tmp_path, monkeypatch):
     assert hits == []
     assert credits_used == 0
     assert status == "api_failed"
+
+
+def test_domain_filtering_rejects_untrusted(tmp_path, monkeypatch):
+    """Results from untrusted domains should be filtered out."""
+    mock_response = {
+        "organic_results": [
+            {"position": 1, "title": "Reddit Post", "link": "https://www.reddit.com/r/arduino/...", "snippet": "Community discussion"},
+            {"position": 2, "title": "Arduino Docs", "link": "https://docs.arduino.cc/hardware/uno-r4", "snippet": "Official docs"},
+            {"position": 3, "title": "Random Blog", "link": "https://random-blog.com/arduino", "snippet": "Tutorial"},
+        ]
+    }
+    
+    # Mock _fetch_page to return None
+    def mock_fetch(self, url):
+        return None
+    monkeypatch.setattr("embeduino.web_search.SerpApiSearcher._fetch_page", mock_fetch)
+    
+    searcher = SerpApiSearcher(
+        api_key="test",
+        cache_dir=tmp_path,
+        max_calls_per_run=10,
+        timeout_s=90,
+        trusted_domains=["docs.arduino.cc", "arduino.cc", "github.com", "forum.arduino.cc"],
+    )
+    
+    question = "test query"
+    hits = searcher._parse_results(mock_response, num_results=10, question=question)
+    
+    # Only the docs.arduino.cc result should remain
+    assert len(hits) == 1
+    assert hits[0].url == "https://docs.arduino.cc/hardware/uno-r4"
+    assert "reddit" not in hits[0].url.lower()
+    assert "random-blog" not in hits[0].url.lower()
+
+
+def test_fallback_counts_second_credit(tmp_path, monkeypatch):
+    """Fallback search should add a second credit to the count."""
+    call_count = [0]
+    
+    def mock_get(url, params=None, timeout=None, **kwargs):
+        call_count[0] += 1
+        
+        class MockResponse:
+            def raise_for_status(self):
+                pass
+            def json(self):
+                # First call (async): return 0 organic results
+                if call_count[0] == 1:
+                    return {"search_metadata": {"id": "test_id"}}
+                # Polling: return success with 0 results
+                elif "searches/" in url and call_count[0] == 2:
+                    return {
+                        "search_metadata": {"status": "Success"},
+                        "organic_results": []  # 0 results triggers fallback
+                    }
+                # Fallback call: return some results
+                else:
+                    return {
+                        "organic_results": [
+                            {"position": 1, "title": "Test", "link": "https://docs.arduino.cc/test", "snippet": "snippet"}
+                        ]
+                    }
+        return MockResponse()
+    
+    monkeypatch.setattr("httpx.get", mock_get)
+    monkeypatch.setattr("time.sleep", lambda x: None)
+    
+    # Mock _fetch_page
+    def mock_fetch(self, url):
+        return None
+    monkeypatch.setattr("embeduino.web_search.SerpApiSearcher._fetch_page", mock_fetch)
+    
+    searcher = SerpApiSearcher(
+        api_key="fake_key",
+        cache_dir=tmp_path,
+        max_calls_per_run=10,
+        timeout_s=90,
+    )
+    
+    hits, credits_used, status = searcher.search(
+        "test query",
+        trusted_sites=["docs.arduino.cc", "github.com"],
+        num_results=5,
+        prefer_docs=True,
+        use_async=True,
+    )
+    
+    assert status == "api_success"
+    assert credits_used == 2, f"Expected 2 credits (initial + fallback), got {credits_used}"
+    assert len(hits) >= 1
+
+
+def test_page_fetching_extracts_main_content(tmp_path, monkeypatch):
+    """Page fetching should extract main content and create chunks."""
+    from pathlib import Path
+    
+    # Load the HTML fixture
+    fixture_path = Path(__file__).parent / "fixtures" / "arduino_uno_r4_wifi.html"
+    html_content = fixture_path.read_text()
+    
+    def mock_httpx_get(url, headers=None, timeout=None, follow_redirects=None):
+        class MockResponse:
+            def raise_for_status(self):
+                pass
+            headers = {"content-type": "text/html; charset=utf-8"}
+            content = html_content.encode()
+        return MockResponse()
+    
+    monkeypatch.setattr("httpx.get", mock_httpx_get)
+    
+    searcher = SerpApiSearcher(
+        api_key="test",
+        cache_dir=tmp_path,
+        max_calls_per_run=10,
+        timeout_s=90,
+    )
+    
+    url = "https://docs.arduino.cc/hardware/uno-r4-wifi"
+    content = searcher._fetch_page(url)
+    
+    assert content is not None
+    assert "Pin Specifications" in content
+    assert "14 (of which 6 provide PWM output)" in content
+    assert "Renesas RA4M1" in content
+    # Analytics script should be removed
+    assert "analytics.js" not in content
+    # Footer should be removed
+    assert "All rights reserved" not in content or len(content) < 5000
+
+
+def test_page_fetching_creates_multiple_chunks(tmp_path, monkeypatch):
+    """Fetched pages should be chunked into multiple retrievable pieces."""
+    from pathlib import Path
+    
+    fixture_path = Path(__file__).parent / "fixtures" / "arduino_uno_r4_wifi.html"
+    html_content = fixture_path.read_text()
+    
+    def mock_httpx_get(url, headers=None, timeout=None, follow_redirects=None):
+        class MockResponse:
+            def raise_for_status(self):
+                pass
+            headers = {"content-type": "text/html; charset=utf-8"}
+            content = html_content.encode()
+        return MockResponse()
+    
+    monkeypatch.setattr("httpx.get", mock_httpx_get)
+    
+    mock_serp_response = {
+        "organic_results": [
+            {
+                "position": 1,
+                "title": "Arduino UNO R4 WiFi",
+                "link": "https://docs.arduino.cc/hardware/uno-r4-wifi",
+                "snippet": "Official documentation"
+            }
+        ]
+    }
+    
+    searcher = SerpApiSearcher(
+        api_key="test",
+        cache_dir=tmp_path,
+        max_calls_per_run=10,
+        timeout_s=90,
+    )
+    
+    question = "What are the pin specifications for Arduino UNO R4 WiFi?"
+    hits = searcher._parse_results(mock_serp_response, num_results=5, question=question)
+    
+    # Should create multiple chunks from the page
+    assert len(hits) >= 1
+    assert all(hit.url == "https://docs.arduino.cc/hardware/uno-r4-wifi" for hit in hits)
+    
+    # At least one chunk should contain pin specs
+    pin_spec_chunks = [h for h in hits if "Pin Specifications" in h.text or "Digital I/O" in h.text]
+    assert len(pin_spec_chunks) >= 1
+    
+    # Check that the chunk has useful content (not just snippet)
+    assert any("14 (of which 6 provide PWM output)" in h.text for h in hits)
+
+
+def test_dynamic_scoring_beats_flat_score(tmp_path, monkeypatch):
+    """Pages with better lexical overlap should get higher scores."""
+    # Mock _fetch_page to return None (use snippets)
+    def mock_fetch(self, url):
+        return None
+    monkeypatch.setattr("embeduino.web_search.SerpApiSearcher._fetch_page", mock_fetch)
+    
+    searcher = SerpApiSearcher(
+        api_key="test",
+        cache_dir=tmp_path,
+        max_calls_per_run=10,
+        timeout_s=90,
+    )
+    
+    question = "What are the pin specifications for Arduino UNO R4 WiFi?"
+    
+    # Text with high overlap
+    relevant_text = "Arduino UNO R4 WiFi pin specifications include 14 digital I/O pins"
+    score_high = searcher._compute_score(question, relevant_text)
+    
+    # Text with low overlap
+    generic_text = "Download the Arduino software from our website"
+    score_low = searcher._compute_score(question, generic_text)
+    
+    assert score_high > score_low
+    assert score_high > 0.5
+    assert score_low < 0.7
