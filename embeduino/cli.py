@@ -23,12 +23,17 @@ console = Console()
 
 
 def _setup_logging(verbose: bool) -> None:
-    level = logging.DEBUG if verbose else logging.INFO
+    level = logging.INFO if verbose else logging.WARNING
     logging.basicConfig(
         level=level,
         format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
         datefmt="%H:%M:%S",
     )
+    
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("sentence_transformers").setLevel(logging.WARNING)
+    logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
+    logging.getLogger("chromadb").setLevel(logging.WARNING)
 
 
 @click.group()
@@ -109,12 +114,19 @@ def ingest_cmd(
 @click.argument("question")
 @click.option("--top-k", type=int, default=None)
 @click.option("--min-score", type=float, default=None)
+@click.option(
+    "--web",
+    type=click.Choice(["auto", "always", "off"], case_sensitive=False),
+    default=None,
+    help="Web search mode (default: from config or 'auto')",
+)
 @click.pass_context
 def ask_cmd(
     ctx: click.Context,
     question: str,
     top_k: Optional[int],
     min_score: Optional[float],
+    web: Optional[str],
 ) -> None:
     """Ask a question; print answer, citations, and retrieved chunk previews."""
     settings = get_settings()
@@ -136,28 +148,48 @@ def ask_cmd(
         )
         sys.exit(1)
 
-    result = rag_ask(question, store, settings)
+    web_mode_override = web.lower() if web else None
+    result = rag_ask(question, store, settings, web_mode_override=web_mode_override)
 
     style = "yellow" if result.weak_retrieval else "green"
     console.print(Panel(result.answer, title="Answer", border_style=style))
-
-    table = Table(title="Citations / retrieved chunks", show_lines=True)
-    table.add_column("ID", style="cyan", no_wrap=True)
-    table.add_column("Score", justify="right")
-    table.add_column("Source")
-    table.add_column("Heading")
-    table.add_column("Preview")
-    for c in result.citations:
-        table.add_row(
-            str(c["id"]),
-            f"{c['score']:.3f}",
-            str(c.get("source", "")),
-            str(c.get("heading_path", "")),
-            (c.get("preview") or "")[:100],
+    
+    if result.web_search_used:
+        num_web = sum(
+            1 for h in result.retrieved
+            if h.get("metadata", {}).get("chunk_type") == "web"
         )
-    console.print(table)
+        if result.web_status == "cache_hit":
+            console.print(f"[green]Web search served from cache (0 SerpApi credits), {num_web} chunks[/]")
+        elif result.web_status == "api_success" and result.web_credits_used > 0:
+            credit_label = "credit" if result.web_credits_used == 1 else "credits"
+            console.print(f"[yellow]Web search used ({result.web_credits_used} SerpApi {credit_label}), {num_web} chunks[/]")
+        elif result.web_status == "timeout":
+            console.print(f"[red]Web search timed out (took >90s, {result.web_credits_used} credit used), {num_web} chunks[/]")
+        elif result.web_status == "api_failed":
+            console.print("[red]Web search failed (error), 0 chunks[/]")
+        elif result.web_status == "no_key":
+            console.print("[dim]Web search skipped (no API key)[/]")
+        elif result.web_status == "max_calls":
+            console.print("[dim]Web search skipped (max calls reached)[/]")
+        else:
+            console.print(f"[dim]Web search: unknown status, {num_web} chunks[/]")
+    else:
+        console.print("[dim]Web search: not triggered[/]")
 
-    console.print("\n[dim]Retrieved chunk ids:[/]")
+    console.print("\n[bold]Citations:[/]")
+    for i, c in enumerate(result.citations, 1):
+        origin_badge = "[cyan][web][/]" if c.get("origin") == "web" else "[dim][local][/]"
+        rrf_str = f" rrf={c['rrf_score']:.3f}" if c.get("rrf_score") else ""
+        console.print(f"{i}. {origin_badge} [cyan]{c['id']}[/] score={c['score']:.3f}{rrf_str}")
+        if c.get("url"):
+            console.print(f"   URL: {c['url']}")
+        console.print(f"   Source: {c.get('source', '')}")
+        console.print(f"   Heading: {c.get('heading_path', '')}")
+        console.print(f"   Preview: {(c.get('preview') or '')[:80]}...")
+        console.print("")
+
+    console.print("[dim]Retrieved chunk ids:[/]")
     for h in result.retrieved:
         meta = h.get("metadata") or {}
         console.print(
@@ -174,8 +206,14 @@ def ask_cmd(
     default=None,
     help="JSONL of {question, expect_contains?}; default scripts/golden_qa.jsonl",
 )
+@click.option(
+    "--web",
+    type=click.Choice(["auto", "always", "off"], case_sensitive=False),
+    default="off",
+    help="Web search mode for eval (default: off to avoid credits)",
+)
 @click.pass_context
-def eval_cmd(ctx: click.Context, questions: Optional[Path]) -> None:
+def eval_cmd(ctx: click.Context, questions: Optional[Path], web: str) -> None:
     """Run minimal golden Q&A checks against the local store."""
     import json
 
@@ -192,6 +230,8 @@ def eval_cmd(ctx: click.Context, questions: Optional[Path]) -> None:
         sys.exit(1)
 
     passed = failed = 0
+    web_mode = web.lower()
+    
     for line in path.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
@@ -200,7 +240,12 @@ def eval_cmd(ctx: click.Context, questions: Optional[Path]) -> None:
         q = item["question"]
         expect = item.get("expect_contains", [])
         expect_dont_know = item.get("expect_dont_know", False)
-        result = rag_ask(q, store, settings)
+        expect_web = item.get("expect_web", False)
+        
+        # Override web mode if question expects web
+        question_web_mode = "always" if expect_web else web_mode
+        
+        result = rag_ask(q, store, settings, web_mode_override=question_web_mode)
         ok = True
         if expect_dont_know:
             ok = result.weak_retrieval or "don't know" in result.answer.lower()
@@ -211,7 +256,8 @@ def eval_cmd(ctx: click.Context, questions: Optional[Path]) -> None:
                 for e in expect
             )
         status = "[green]PASS[/]" if ok else "[red]FAIL[/]"
-        console.print(f"{status}  {q}")
+        web_badge = "[cyan][web][/]" if result.web_search_used else ""
+        console.print(f"{status} {web_badge} {q}")
         if ok:
             passed += 1
         else:

@@ -6,3 +6,6 @@
 {"question": "What is the PWM value range for analogWrite?", "expect_contains": ["255"]}
 {"question": "Why is delay problematic in sketches?", "expect_contains": ["delay"]}
 {"question": "How do I configure a quantum flux capacitor on Arduino?", "expect_dont_know": true}
+{"question": "What are the pin specifications for Arduino UNO R4 WiFi?", "expect_web": true}
+{"question": "How do I use the ESP32 with Arduino IDE?", "expect_web": true}
+{"question": "What libraries are available for Nano 33 BLE Sense?", "expect_web": true}
