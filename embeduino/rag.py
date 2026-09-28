@@ -210,20 +210,69 @@ def _extractive_answer(question: str, hits: List[Dict[str, Any]]) -> str:
             "I don't know — no relevant documentation chunks were retrieved "
             "for this question."
         )
-
-    apis = _api_mentions(question)
-    def _api_match(h: Dict[str, Any]) -> bool:
-        heading = ((h.get("metadata") or {}).get("heading_path") or "").lower().replace("()", "")
-        return any(api in heading for api in apis) if apis else True
-
-    ranked = [h for h in hits if _api_match(h)] or list(hits)
-    preferred = []
-    for h in ranked:
-        heading = ((h.get("metadata") or {}).get("heading_path") or "").lower()
-        if any(k in heading for k in ("description", "parameter", "notes", "syntax", "return")):
-            preferred.append(h)
-    primary = preferred[0] if preferred else ranked[0]
-
+    
+    # Detect product names in question (UNO R4, ESP32, Nano 33, etc.)
+    product_patterns = [
+        r'\b(UNO\s+R\d+(?:\s+\w+)?)\b',
+        r'\b(Nano\s+(?:33|ESP32)(?:\s+\w+)?)\b',
+        r'\b(ESP32(?:-\w+)?)\b',
+        r'\b(Mega\s+\d+)\b',
+        r'\b(Due|Leonardo|Micro|Yun)\b',
+    ]
+    
+    mentioned_products = set()
+    for pattern in product_patterns:
+        for match in re.finditer(pattern, question, re.IGNORECASE):
+            mentioned_products.add(match.group(1).lower())
+    
+    # Check if local chunks mention the product
+    local_has_product = False
+    if mentioned_products:
+        for h in hits:
+            if h.get("metadata", {}).get("chunk_type") != "web":
+                text_lower = h.get("text", "").lower()
+                if any(prod in text_lower for prod in mentioned_products):
+                    local_has_product = True
+                    break
+    
+    # Choose primary chunk by best rerank or RRF score across ALL sources
+    # If question mentions a product not in local chunks, prefer best web chunk
+    best_chunk = None
+    best_score = -1.0
+    
+    for h in hits:
+        # Use RRF score if available, else rerank_score
+        score = h.get("rrf_score", h.get("rerank_score", h.get("score", 0.0)))
+        
+        is_web = h.get("metadata", {}).get("chunk_type") == "web"
+        
+        # Boost web chunks if question mentions product not in local
+        if is_web and mentioned_products and not local_has_product:
+            score += 0.1
+        
+        if score > best_score:
+            best_score = score
+            best_chunk = h
+    
+    # For ties within local chunks, prefer certain heading types
+    if not best_chunk.get("metadata", {}).get("chunk_type") == "web":
+        same_score_local = [
+            h for h in hits
+            if h.get("metadata", {}).get("chunk_type") != "web"
+            and abs((h.get("rrf_score", h.get("rerank_score", h.get("score", 0.0)))) - best_score) < 0.01
+        ]
+        
+        if len(same_score_local) > 1:
+            preferred = []
+            for h in same_score_local:
+                heading = ((h.get("metadata") or {}).get("heading_path") or "").lower()
+                if any(k in heading for k in ("description", "parameter", "notes", "syntax", "return")):
+                    preferred.append(h)
+            if preferred:
+                best_chunk = preferred[0]
+    
+    primary = best_chunk
+    
     # Optionally append a complementary Parameters/Returns chunk from same source
     extras_chunks = []
     src = (primary.get("metadata") or {}).get("source")
@@ -237,7 +286,7 @@ def _extractive_answer(question: str, hits: List[Dict[str, Any]]) -> str:
             extras_chunks.append(h)
         if len(extras_chunks) >= 2:
             break
-
+    
     def _format_chunk(h: Dict[str, Any]) -> str:
         text = h.get("text") or ""
         paras = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]

@@ -284,20 +284,25 @@ class SerpApiSearcher:
         credits_used is the total number of credits consumed (0, 1, or 2).
         status is one of: "cache_hit", "api_success", "api_failed", "no_key", "max_calls", "timeout"
         
-        When use_async=True, initiates async search (async=true) and polls for results.
-        Polling does not cost credits, only the initial async search request costs 1 credit.
+        Uses as_sitesearch parameter for reliable site filtering.
+        Checks search_information for query rewrites.
         """
         query = _build_keyword_query(question)
-        site_filter = f"site:{trusted_sites[0]}" if prefer_docs and trusted_sites else " OR ".join(f"site:{s}" for s in trusted_sites)
-        full_query = f"{query} {site_filter}"
+        
+        # Use SerpApi's as_sitesearch parameter for the preferred domain
+        preferred_site = trusted_sites[0] if prefer_docs and trusted_sites else None
         
         params = {
             "engine": "google",
             "hl": "en",
             "gl": "us",
+            "q": query,  # No site: in query string
         }
         
-        cache_key = self._cache_key(full_query, params)
+        if preferred_site:
+            params["as_sitesearch"] = preferred_site
+        
+        cache_key = self._cache_key(query + (f"_site:{preferred_site}" if preferred_site else ""), params)
         cached = self._read_cache(cache_key)
         
         if cached is not None:
@@ -318,7 +323,6 @@ class SerpApiSearcher:
         
         url = "https://serpapi.com/search"
         params["api_key"] = self.api_key
-        params["q"] = full_query
         
         if use_async:
             params["async"] = "true"
@@ -326,7 +330,8 @@ class SerpApiSearcher:
         credits_used = 0
         
         try:
-            logger.info("SerpApi: %s search (query=%r)", "async" if use_async else "sync", full_query[:80])
+            logger.info("SerpApi: %s search (query=%r, as_sitesearch=%s)", 
+                       "async" if use_async else "sync", query[:80], preferred_site or "none")
             if use_async:
                 print("  Searching the web...")
             
@@ -346,16 +351,25 @@ class SerpApiSearcher:
                 result_data, poll_status = self._poll_search(search_id)
                 
                 if poll_status == "success" and result_data:
+                    # Check if Google rewrote the query
+                    search_info = result_data.get("search_information", {})
+                    if search_info.get("spelling_fix") or search_info.get("showing_results_for"):
+                        logger.warning("Google rewrote query: %s", search_info.get("query_displayed"))
+                    
                     self._write_cache(cache_key, result_data)
                     hits = self._parse_results(result_data, num_results, question)
                     organic_count = len(result_data.get("organic_results", []))
-                    logger.debug("SerpApi: received %d organic_results", organic_count)
+                    trusted_count = len(hits)
+                    
+                    logger.debug("SerpApi: received %d organic_results, %d on trusted domains", organic_count, trusted_count)
                     logger.info("SerpApi: retrieved %d web chunks (%d credit used)", len(hits), credits_used)
                     
-                    if organic_count == 0 and prefer_docs and self.calls_made < self.max_calls:
+                    # If fewer than 2 results on trusted domains, try fallback
+                    if trusted_count < 2 and prefer_docs and self.calls_made < self.max_calls:
+                        logger.info("SerpApi: only %d trusted results, running fallback", trusted_count)
                         fallback_hits, fallback_credits, fallback_status = self._fallback_search(query, trusted_sites, num_results, question)
                         credits_used += fallback_credits
-                        if fallback_hits:
+                        if len(fallback_hits) > len(hits):
                             return fallback_hits, credits_used, "api_success"
                     
                     return hits, credits_used, "api_success"
@@ -364,16 +378,24 @@ class SerpApiSearcher:
                 else:
                     return [], credits_used, "api_failed"
             else:
+                # Sync mode (similar logic)
+                search_info = data.get("search_information", {})
+                if search_info.get("spelling_fix") or search_info.get("showing_results_for"):
+                    logger.warning("Google rewrote query: %s", search_info.get("query_displayed"))
+                
                 self._write_cache(cache_key, data)
                 hits = self._parse_results(data, num_results, question)
                 organic_count = len(data.get("organic_results", []))
-                logger.debug("SerpApi: received %d organic_results", organic_count)
+                trusted_count = len(hits)
+                
+                logger.debug("SerpApi: received %d organic_results, %d on trusted domains", organic_count, trusted_count)
                 logger.info("SerpApi: retrieved %d web chunks (%d credit used)", len(hits), credits_used)
                 
-                if organic_count == 0 and prefer_docs and self.calls_made < self.max_calls:
+                if trusted_count < 2 and prefer_docs and self.calls_made < self.max_calls:
+                    logger.info("SerpApi: only %d trusted results, running fallback", trusted_count)
                     fallback_hits, fallback_credits, fallback_status = self._fallback_search(query, trusted_sites, num_results, question)
                     credits_used += fallback_credits
-                    if fallback_hits:
+                    if len(fallback_hits) > len(hits):
                         return fallback_hits, credits_used, "api_success"
                 
                 return hits, credits_used, "api_success"
@@ -384,12 +406,12 @@ class SerpApiSearcher:
     def _fallback_search(
         self, query: str, trusted_sites: List[str], num_results: int, question: str
     ) -> tuple[List[WebHit], int, str]:
-        """Fallback search with OR of all trusted site filters (not unfiltered)."""
-        logger.info("SerpApi: 0 results with docs preference, retrying with all trusted sites")
+        """Fallback search with OR of all trusted site filters in query."""
+        logger.info("SerpApi: fallback with all trusted sites")
         
-        # Use OR of all trusted sites, never unfiltered
+        # Use OR of all trusted sites in the query
         site_filter = " OR ".join(f"site:{s}" for s in trusted_sites)
-        fallback_query = f"{query} {site_filter}"
+        fallback_query = f"{query} ({site_filter})"
         
         fallback_params = {
             "engine": "google",
@@ -397,6 +419,7 @@ class SerpApiSearcher:
             "gl": "us",
             "api_key": self.api_key,
             "q": fallback_query,
+            # Don't use as_sitesearch here since we have multiple sites
         }
         
         fallback_key = self._cache_key(fallback_query, {k: v for k, v in fallback_params.items() if k != "api_key"})
@@ -416,7 +439,9 @@ class SerpApiSearcher:
             self.calls_made += 1
             self._write_cache(fallback_key, data)
             hits = self._parse_results(data, num_results, question)
-            logger.debug("SerpApi fallback: received %d organic_results", len(data.get("organic_results", [])))
+            organic_count = len(data.get("organic_results", []))
+            trusted_count = len(hits)
+            logger.debug("SerpApi fallback: received %d organic_results, %d on trusted domains", organic_count, trusted_count)
             logger.info("SerpApi fallback: retrieved %d web chunks (2nd credit used)", len(hits))
             return hits, 1, "api_success"
         except Exception as e:
@@ -491,7 +516,14 @@ class SerpApiSearcher:
 
 
 def _build_keyword_query(question: str) -> str:
-    """Extract keywords from natural language question for better search results."""
+    """
+    Extract keywords from natural language question for better search results.
+    
+    - Quotes product names: "UNO R4 WiFi", "ESP32", "Nano 33 BLE"
+    - Maps spec-type terms: pin/pins/specifications → "pinout tech specs"
+    - Preserves original casing for product identifiers
+    - Keeps tokens with digits regardless of length
+    """
     import re
     
     stop_words = {
@@ -500,19 +532,57 @@ def _build_keyword_query(question: str) -> str:
         "from", "to", "of", "in", "on", "at", "by", "a", "an", "i", "you"
     }
     
-    words = re.findall(r'\w+', question)
+    # Detect product names (board names with model numbers)
+    # Match patterns like: UNO R4, ESP32, Nano 33, Arduino Mega 2560, etc.
+    product_patterns = [
+        r'\b(UNO\s+R\d+(?:\s+\w+)?)\b',  # UNO R4, UNO R4 WiFi
+        r'\b(Nano\s+(?:33|ESP32)(?:\s+\w+)?)\b',  # Nano 33 BLE, Nano ESP32
+        r'\b(ESP32(?:-\w+)?)\b',  # ESP32, ESP32-S3
+        r'\b(Mega\s+\d+)\b',  # Mega 2560
+        r'\b(Due|Leonardo|Micro|Yun)\b',  # Other boards
+    ]
+    
+    quoted_products = []
+    question_without_products = question
+    
+    for pattern in product_patterns:
+        matches = re.finditer(pattern, question, re.IGNORECASE)
+        for match in matches:
+            product = match.group(1)
+            # Preserve original casing from question
+            quoted_products.append(f'"{product}"')
+            # Remove from question to avoid duplication
+            question_without_products = question_without_products.replace(match.group(0), '')
+    
+    # Map specification-type terms
+    spec_terms = {
+        'pin', 'pins', 'pinout', 'specifications', 'specification', 
+        'specs', 'spec', 'technical'
+    }
+    
+    words = re.findall(r'\w+', question_without_products)
+    has_spec_query = any(w.lower() in spec_terms for w in words)
     
     keywords = []
+    
+    # Add mapped spec terms if this is a specs question
+    if has_spec_query:
+        keywords.append("pinout tech specs")
+    
+    # Add other keywords
     for w in words:
         w_lower = w.lower()
         if w_lower in stop_words:
             continue
-        if any(c.isdigit() for c in w):
+        if w_lower in spec_terms:
+            continue  # Already handled above
+        # Keep tokens with digits or longer than 2 chars
+        if any(c.isdigit() for c in w) or len(w) > 2:
             keywords.append(w)
-        elif len(w) > 2:
-            keywords.append(w_lower)
     
-    return " ".join(keywords[:10]) if keywords else question
+    # Combine: quoted products + keywords
+    result_parts = quoted_products + keywords[:8]
+    return " ".join(result_parts) if result_parts else question
 
 
 def should_trigger_web_search(
