@@ -104,3 +104,26 @@ class VectorStore:
 
     def count(self) -> int:
         return self._collection.count()
+    
+    def get_all_chunks(self) -> List[Dict[str, Any]]:
+        """Get all chunks from the store for BM25 indexing."""
+        count = self.count()
+        if count == 0:
+            return []
+        
+        result = self._collection.get(
+            include=["documents", "metadatas"],
+        )
+        
+        chunks = []
+        ids = result.get("ids", [])
+        docs = result.get("documents", [])
+        metas = result.get("metadatas", [])
+        
+        for i, cid in enumerate(ids):
+            chunks.append({
+                "id": cid,
+                "text": docs[i] if i < len(docs) else "",
+                "metadata": metas[i] if i < len(metas) else {},
+            })
+        return chunks
