@@ -144,7 +144,7 @@ def test_web_chunks_reach_citations_realistic_fusion(
             1,  # credits_used (int)
             "api_success"
         )
-        mock_searcher._compute_score = lambda q, t: 0.6  # Mock score computation
+        mock_searcher._compute_score = lambda q, t, u="": 0.6  # Mock score computation
         mock_searcher_class.return_value = mock_searcher
         
         result = ask(question, mock_store, mock_settings)
@@ -249,7 +249,7 @@ def test_web_chunks_pass_weak_gate_with_lexical_overlap(
             1,  # credits_used
             "api_success"
         )
-        mock_searcher._compute_score = lambda q, t: 0.6
+        mock_searcher._compute_score = lambda q, t, u="": 0.6
         mock_searcher_class.return_value = mock_searcher
         
         result = ask(question, mock_store, mock_settings)
@@ -291,7 +291,7 @@ def test_extractive_answer_uses_web_chunk_as_primary(
             1,  # credits_used
             "api_success"
         )
-        mock_searcher._compute_score = lambda q, t: 0.7
+        mock_searcher._compute_score = lambda q, t, u="": 0.7
         mock_searcher_class.return_value = mock_searcher
         
         result = ask(question, mock_store, mock_settings)
@@ -323,7 +323,7 @@ def test_zero_web_results_handled_gracefully(mock_local_chunks, mock_settings, m
     with patch("embeduino.rag.SerpApiSearcher") as mock_searcher_class:
         mock_searcher = MagicMock()
         mock_searcher.search.return_value = ([], 1, "api_success")  # 0 results, 1 credit
-        mock_searcher._compute_score = lambda q, t: 0.5
+        mock_searcher._compute_score = lambda q, t, u="": 0.5
         mock_searcher_class.return_value = mock_searcher
         
         result = ask(question, mock_store, mock_settings, web_mode_override="always")

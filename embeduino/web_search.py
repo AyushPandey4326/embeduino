@@ -96,7 +96,7 @@ class SerpApiSearcher:
             return False
     
     def _fetch_page(self, url: str) -> Optional[str]:
-        """Fetch and extract main text from a web page."""
+        """Fetch and extract main text from a web page, stripping chrome/nav/UI."""
         # Check cache first
         url_hash = hashlib.sha1(url.encode()).hexdigest()[:16]
         cache_file = self.page_cache_dir / f"{url_hash}.txt"
@@ -130,9 +130,27 @@ class SerpApiSearcher:
             # Extract text
             soup = BeautifulSoup(resp.content, "lxml")
             
-            # Remove script, style, nav, footer, and other non-content elements
-            for tag in soup(["script", "style", "nav", "footer", "header", "aside", "iframe", "noscript"]):
+            # Remove non-content elements (aggressive for GitHub/Discourse)
+            for tag in soup([
+                "script", "style", "nav", "footer", "header", "aside", "iframe", "noscript",
+                "button",  # GitHub buttons (Fork, Star, etc.)
+            ]):
                 tag.decompose()
+            
+            # Remove by class/id patterns (GitHub/Discourse UI)
+            ui_patterns = [
+                "sign-in", "signin", "notification", "subscribe", "login",
+                "avatar", "timestamp", "username", "reply", "comment-meta",
+                "sidebar", "menu", "breadcrumb", "pagination",
+                "fork", "star", "watch", "sponsor",  # GitHub actions
+                "header", "footer", "navbar",
+            ]
+            
+            for pattern in ui_patterns:
+                for tag in soup.find_all(class_=lambda x: x and pattern in x.lower()):
+                    tag.decompose()
+                for tag in soup.find_all(id=lambda x: x and pattern in x.lower()):
+                    tag.decompose()
             
             # Get main content (try common content containers first)
             main_content = soup.find("main") or soup.find("article") or soup.find("div", class_=re.compile(r"content|main|article|body", re.I))
@@ -144,6 +162,17 @@ class SerpApiSearcher:
             
             # Clean up whitespace
             lines = [line.strip() for line in text.split("\n") if line.strip()]
+            # Filter out common UI text fragments
+            ui_fragments = {
+                "you must be signed in", "fork", "star", "watch", "notification settings",
+                "back to top", "© 20", "all rights reserved", "terms of service",
+                "privacy policy", "cookie", "sign in", "sign up", "register",
+            }
+            lines = [
+                line for line in lines
+                if not any(frag in line.lower() for frag in ui_fragments) or len(line) > 80
+            ]
+            
             text = "\n\n".join(lines)
             
             # Limit size
@@ -163,8 +192,8 @@ class SerpApiSearcher:
             logger.warning("Failed to fetch %s: %s", url, e)
             return None
     
-    def _chunk_page_content(self, content: str, url: str, title: str, max_chunk_size: int = 800) -> List[str]:
-        """Chunk fetched page content into manageable pieces."""
+    def _chunk_page_content(self, content: str, url: str, title: str, max_chunk_size: int = 800, min_chunk_size: int = 150) -> List[str]:
+        """Chunk fetched page content into manageable pieces, dropping short chunks."""
         if not content:
             return []
         
@@ -179,7 +208,10 @@ class SerpApiSearcher:
             para_size = len(para)
             
             if current_size + para_size > max_chunk_size and current_chunk:
-                chunks.append("\n\n".join(current_chunk))
+                chunk_text = "\n\n".join(current_chunk)
+                # Only keep chunks with enough real content
+                if len(chunk_text) >= min_chunk_size:
+                    chunks.append(chunk_text)
                 current_chunk = []
                 current_size = 0
             
@@ -187,24 +219,51 @@ class SerpApiSearcher:
             current_size += para_size
         
         if current_chunk:
-            chunks.append("\n\n".join(current_chunk))
+            chunk_text = "\n\n".join(current_chunk)
+            if len(chunk_text) >= min_chunk_size:
+                chunks.append(chunk_text)
         
         # Limit to top 3 chunks
         return chunks[:3]
     
-    def _compute_score(self, question: str, text: str) -> float:
-        """Compute relevance score based on lexical overlap."""
+    def _compute_score(self, question: str, text: str, url: str = "") -> float:
+        """
+        Compute relevance score based on lexical overlap and source priority.
+        
+        Source priority:
+        1. docs.arduino.cc/hardware/* (official product pages): +0.3
+        2. Other docs.arduino.cc: +0.2
+        3. github.com/arduino/*: +0.15
+        4. forum.arduino.cc: +0.1
+        5. Other github.com: +0.05
+        """
         q_terms = set(re.findall(r'\w+', question.lower()))
         q_terms = {t for t in q_terms if len(t) > 2}
         
         if not q_terms:
-            return 0.5
+            base_score = 0.5
+        else:
+            text_terms = set(re.findall(r'\w+', text.lower()))
+            overlap = len(q_terms & text_terms)
+            base_score = 0.3 + (0.7 * overlap / len(q_terms))
+            base_score = min(base_score, 1.0)
         
-        text_terms = set(re.findall(r'\w+', text.lower()))
-        overlap = len(q_terms & text_terms)
-        score = 0.3 + (0.7 * overlap / len(q_terms))
+        # Add source priority bonus
+        bonus = 0.0
+        url_lower = url.lower()
         
-        return min(score, 1.0)
+        if "docs.arduino.cc/hardware/" in url_lower:
+            bonus = 0.3  # Highest priority: official product pages
+        elif "docs.arduino.cc" in url_lower:
+            bonus = 0.2  # Other docs pages
+        elif "github.com/arduino/" in url_lower:
+            bonus = 0.15  # Official Arduino GitHub
+        elif "forum.arduino.cc" in url_lower:
+            bonus = 0.1  # Forum
+        elif "github.com" in url_lower:
+            bonus = 0.05  # Other GitHub
+        
+        return min(base_score + bonus, 1.0)
     
     def _cache_key(self, query: str, params: Dict[str, Any]) -> str:
         """Generate cache key from query + params."""
@@ -477,7 +536,7 @@ class SerpApiSearcher:
                 for i, chunk_text in enumerate(chunks_text):
                     hit_id = f"web:{hashlib.sha1(f'{link}:{i}'.encode()).hexdigest()[:12]}"
                     text = f"{title}\n\n{chunk_text}"
-                    score = self._compute_score(question, text)
+                    score = self._compute_score(question, text, link)
                     
                     hits.append(
                         WebHit(
@@ -494,7 +553,7 @@ class SerpApiSearcher:
                 # Fallback to snippet if fetch failed
                 hit_id = f"web:{hashlib.sha1(link.encode()).hexdigest()[:12]}"
                 text = f"{title}\n\n{snippet}" if snippet else title
-                score = self._compute_score(question, text)
+                score = self._compute_score(question, text, link)
                 
                 hits.append(
                     WebHit(
@@ -519,21 +578,13 @@ def _build_keyword_query(question: str) -> str:
     """
     Extract keywords from natural language question for better search results.
     
-    - Quotes product names: "UNO R4 WiFi", "ESP32", "Nano 33 BLE"
-    - Maps spec-type terms: pin/pins/specifications → "pinout tech specs"
+    - When product detected: quote it + max 1 extra word ("UNO R4 WiFi" specifications)
+    - Maps spec-type terms: pin/pins/specifications → specifications/pinout/datasheet
     - Preserves original casing for product identifiers
-    - Keeps tokens with digits regardless of length
     """
     import re
     
-    stop_words = {
-        "what", "are", "the", "is", "how", "do", "does", "did", "can", "could",
-        "should", "would", "where", "when", "why", "which", "who", "for", "with",
-        "from", "to", "of", "in", "on", "at", "by", "a", "an", "i", "you"
-    }
-    
     # Detect product names (board names with model numbers)
-    # Match patterns like: UNO R4, ESP32, Nano 33, Arduino Mega 2560, etc.
     product_patterns = [
         r'\b(UNO\s+R\d+(?:\s+\w+)?)\b',  # UNO R4, UNO R4 WiFi
         r'\b(Nano\s+(?:33|ESP32)(?:\s+\w+)?)\b',  # Nano 33 BLE, Nano ESP32
@@ -542,47 +593,41 @@ def _build_keyword_query(question: str) -> str:
         r'\b(Due|Leonardo|Micro|Yun)\b',  # Other boards
     ]
     
-    quoted_products = []
-    question_without_products = question
-    
+    product_match = None
     for pattern in product_patterns:
-        matches = re.finditer(pattern, question, re.IGNORECASE)
-        for match in matches:
-            product = match.group(1)
-            # Preserve original casing from question
-            quoted_products.append(f'"{product}"')
-            # Remove from question to avoid duplication
-            question_without_products = question_without_products.replace(match.group(0), '')
+        match = re.search(pattern, question, re.IGNORECASE)
+        if match:
+            product_match = match.group(1)
+            break
     
-    # Map specification-type terms
-    spec_terms = {
-        'pin', 'pins', 'pinout', 'specifications', 'specification', 
-        'specs', 'spec', 'technical'
+    # If product detected, use simple query: "Product" + one spec term
+    if product_match:
+        # Check for spec-type question
+        question_lower = question.lower()
+        if any(term in question_lower for term in ['pin', 'pinout', 'specification', 'spec', 'datasheet']):
+            return f'"{product_match}" specifications'
+        else:
+            # Generic product query
+            return f'"{product_match}"'
+    
+    # Fall back to keyword extraction if no product detected
+    stop_words = {
+        "what", "are", "the", "is", "how", "do", "does", "did", "can", "could",
+        "should", "would", "where", "when", "why", "which", "who", "for", "with",
+        "from", "to", "of", "in", "on", "at", "by", "a", "an", "i", "you"
     }
     
-    words = re.findall(r'\w+', question_without_products)
-    has_spec_query = any(w.lower() in spec_terms for w in words)
-    
+    words = re.findall(r'\w+', question)
     keywords = []
-    
-    # Add mapped spec terms if this is a specs question
-    if has_spec_query:
-        keywords.append("pinout tech specs")
-    
-    # Add other keywords
     for w in words:
         w_lower = w.lower()
         if w_lower in stop_words:
             continue
-        if w_lower in spec_terms:
-            continue  # Already handled above
         # Keep tokens with digits or longer than 2 chars
         if any(c.isdigit() for c in w) or len(w) > 2:
             keywords.append(w)
     
-    # Combine: quoted products + keywords
-    result_parts = quoted_products + keywords[:8]
-    return " ".join(result_parts) if result_parts else question
+    return " ".join(keywords[:6]) if keywords else question
 
 
 def should_trigger_web_search(

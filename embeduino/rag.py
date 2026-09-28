@@ -288,10 +288,42 @@ def _extractive_answer(question: str, hits: List[Dict[str, Any]]) -> str:
             break
     
     def _format_chunk(h: Dict[str, Any]) -> str:
+        """Extract most relevant sentences from chunk based on question overlap."""
         text = h.get("text") or ""
-        paras = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
-        paras = [p for p in paras if not (re.match(r"^#{1,6}\s+", p) and len(p) < 60)]
-        return "\n\n".join(paras[:4]) if paras else text[:700]
+        
+        # Split into sentences/lines
+        sentences = []
+        for para in re.split(r"\n\s*\n", text):
+            para = para.strip()
+            if not para or (re.match(r"^#{1,6}\s+", para) and len(para) < 60):
+                continue
+            # Split on sentence boundaries
+            for sent in re.split(r'[.!?]\s+', para):
+                sent = sent.strip()
+                if len(sent) > 30:  # Min sentence length
+                    sentences.append(sent)
+        
+        if not sentences:
+            return text[:700]
+        
+        # Score sentences by overlap with question
+        q_terms = _tokens(question)
+        scored = []
+        for sent in sentences:
+            sent_terms = _tokens(sent)
+            if sent_terms:
+                overlap = len(q_terms & sent_terms) / len(q_terms) if q_terms else 0
+                scored.append((overlap, sent))
+        
+        # Sort by overlap, take top 3-6
+        scored.sort(key=lambda x: -x[0])
+        top_sentences = [s for _, s in scored[:6] if _>0.1]  # Only if some overlap
+        
+        if not top_sentences:
+            # Fallback to first few sentences
+            top_sentences = sentences[:4]
+        
+        return ". ".join(top_sentences[:6]) + "."
 
     meta = primary.get("metadata") or {}
     source = meta.get("source", primary.get("id", "unknown"))
@@ -416,7 +448,7 @@ def ask(
             num_results=settings.web_num,
         )
         # Convert WebHit objects to dicts with computed scores
-        web_hits_raw = [w.to_dict(score=searcher._compute_score(question, w.text)) for w in web_results]
+        web_hits_raw = [w.to_dict(score=searcher._compute_score(question, w.text, w.url)) for w in web_results]
         web_search_used = True
         web_credits_used = credits_used
         web_status = status
