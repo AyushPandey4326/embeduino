@@ -35,8 +35,13 @@ def mock_serp_response():
     }
 
 
-def test_serpapi_parse_results(mock_serp_response, tmp_path):
+def test_serpapi_parse_results(mock_serp_response, tmp_path, monkeypatch):
     """SerpApi should parse organic results into WebHits, slicing locally."""
+    # Mock _fetch_page to return None (use snippets only for this test)
+    def mock_fetch(self, url):
+        return None
+    monkeypatch.setattr("embeduino.web_search.SerpApiSearcher._fetch_page", mock_fetch)
+    
     searcher = SerpApiSearcher(
         api_key="test_key",
         cache_dir=tmp_path,
@@ -44,7 +49,8 @@ def test_serpapi_parse_results(mock_serp_response, tmp_path):
         timeout_s=90,
     )
     
-    hits = searcher._parse_results(mock_serp_response, num_results=2)
+    question = "What are the pin specifications for Arduino UNO R4 WiFi?"
+    hits = searcher._parse_results(mock_serp_response, num_results=2, question=question)
     
     assert len(hits) == 2
     assert hits[0].title == "Arduino UNO R4 WiFi Specs"
@@ -52,7 +58,7 @@ def test_serpapi_parse_results(mock_serp_response, tmp_path):
     assert "Renesas RA4M1" in hits[0].snippet
     assert hits[0].id.startswith("web:")
     
-    hits_all = searcher._parse_results(mock_serp_response, num_results=100)
+    hits_all = searcher._parse_results(mock_serp_response, num_results=100, question=question)
     assert len(hits_all) == 3
 
 
@@ -85,14 +91,14 @@ def test_serpapi_no_api_key(tmp_path):
         timeout_s=90,
     )
     
-    hits, credit_used, status = searcher.search(
+    hits, credits_used, status = searcher.search(
         "test question",
         trusted_sites=["docs.arduino.cc"],
         num_results=5,
     )
     
     assert hits == []
-    assert credit_used is False
+    assert credits_used == 0
     assert status == "no_key"
 
 
@@ -148,6 +154,7 @@ def test_webhit_to_dict():
     assert d["metadata"]["url"] == "https://docs.arduino.cc/uno-r4"
     assert d["metadata"]["chunk_type"] == "web"
     assert d["metadata"]["title"] == "Arduino UNO R4"
+    assert d["score"] == 0.5  # default score
 
 
 def test_serpapi_max_calls(mock_serp_response, tmp_path, monkeypatch):
@@ -161,12 +168,12 @@ def test_serpapi_max_calls(mock_serp_response, tmp_path, monkeypatch):
     
     searcher.calls_made = 2
     
-    hits, credit_used, status = searcher.search(
+    hits, credits_used, status = searcher.search(
         "test", ["docs.arduino.cc"], num_results=5
     )
     
     assert hits == []
-    assert credit_used is False
+    assert credits_used == 0
     assert status == "max_calls"
 
 
@@ -200,7 +207,7 @@ def test_web_chunks_survive_to_answer_context(tmp_path, monkeypatch):
     cache_key = searcher._cache_key(full_query, params)
     searcher._write_cache(cache_key, fixture_data)
     
-    hits, credit_used, status = searcher.search(
+    hits, credits_used, status = searcher.search(
         "What are the pin specifications for Arduino UNO R4 WiFi?",
         trusted_sites=["docs.arduino.cc", "github.com", "forum.arduino.cc"],
         num_results=5,
@@ -208,7 +215,7 @@ def test_web_chunks_survive_to_answer_context(tmp_path, monkeypatch):
     
     assert called_api[0] is False, "Should use cache, not call API"
     assert status == "cache_hit"
-    assert credit_used is False
+    assert credits_used == 0
     assert len(hits) == 3
     assert all(hit.url for hit in hits)
     assert all(hit.title for hit in hits)
@@ -275,7 +282,7 @@ def test_no_num_parameter_in_request(tmp_path, monkeypatch):
         timeout_s=90,
     )
     
-    hits, credit_used, status = searcher.search(
+    hits, credits_used, status = searcher.search(
         "test query",
         trusted_sites=["docs.arduino.cc"],
         num_results=5,
@@ -291,7 +298,7 @@ def test_async_polling_success(tmp_path, monkeypatch):
     """Async mode should poll until Success status."""
     call_count = [0]
     
-    def mock_get(url, params=None, timeout=None):
+    def mock_get(url, params=None, timeout=None, **kwargs):
         call_count[0] += 1
         
         class MockResponse:
@@ -307,7 +314,7 @@ def test_async_polling_success(tmp_path, monkeypatch):
                     return {
                         "search_metadata": {"status": "Success"},
                         "organic_results": [
-                            {"position": 1, "title": "Test", "link": "https://test.com", "snippet": "snippet"}
+                            {"position": 1, "title": "Test", "link": "https://docs.arduino.cc/test", "snippet": "snippet"}
                         ]
                     }
                 else:
@@ -320,6 +327,11 @@ def test_async_polling_success(tmp_path, monkeypatch):
     monkeypatch.setattr("httpx.get", mock_get)
     monkeypatch.setattr("time.sleep", lambda x: None)
     
+    # Mock _fetch_page to return None (use snippets only)
+    def mock_fetch(self, url):
+        return None
+    monkeypatch.setattr("embeduino.web_search.SerpApiSearcher._fetch_page", mock_fetch)
+    
     searcher = SerpApiSearcher(
         api_key="fake_key",
         cache_dir=tmp_path,
@@ -327,7 +339,7 @@ def test_async_polling_success(tmp_path, monkeypatch):
         timeout_s=90,
     )
     
-    hits, credit_used, status = searcher.search(
+    hits, credits_used, status = searcher.search(
         "test query",
         trusted_sites=["docs.arduino.cc"],
         num_results=5,
@@ -335,7 +347,7 @@ def test_async_polling_success(tmp_path, monkeypatch):
     )
     
     assert status == "api_success"
-    assert credit_used is True
+    assert credits_used >= 1
     assert len(hits) == 1
     assert call_count[0] >= 3
 
@@ -370,7 +382,7 @@ def test_async_overall_timeout(tmp_path, monkeypatch):
         timeout_s=5,
     )
     
-    hits, credit_used, status = searcher.search(
+    hits, credits_used, status = searcher.search(
         "test query",
         trusted_sites=["docs.arduino.cc"],
         num_results=5,
@@ -378,7 +390,7 @@ def test_async_overall_timeout(tmp_path, monkeypatch):
     )
     
     assert status == "timeout"
-    assert credit_used is True
+    assert credits_used >= 1
     assert hits == []
 
 
@@ -397,10 +409,10 @@ def test_api_failure_status(tmp_path, monkeypatch):
         timeout_s=90,
     )
     
-    hits, credit_used, status = searcher.search(
+    hits, credits_used, status = searcher.search(
         "test", ["docs.arduino.cc"], num_results=5, use_async=False
     )
     
     assert hits == []
-    assert credit_used is False
+    assert credits_used == 0
     assert status == "api_failed"

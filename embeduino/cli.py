@@ -160,19 +160,20 @@ def ask_cmd(
             if h.get("metadata", {}).get("chunk_type") == "web"
         )
         if result.web_status == "cache_hit":
-            console.print(f"[green]Web search served from cache (0 SerpApi credits), {num_web} results[/]")
-        elif result.web_status == "api_success" and result.web_credit_used:
-            console.print(f"[yellow]Web search used (1 SerpApi credit), {num_web} results[/]")
+            console.print(f"[green]Web search served from cache (0 SerpApi credits), {num_web} chunks[/]")
+        elif result.web_status == "api_success" and result.web_credits_used > 0:
+            credit_label = "credit" if result.web_credits_used == 1 else "credits"
+            console.print(f"[yellow]Web search used ({result.web_credits_used} SerpApi {credit_label}), {num_web} chunks[/]")
         elif result.web_status == "timeout":
-            console.print(f"[red]Web search timed out (took >90s, 1 credit used), {num_web} results[/]")
+            console.print(f"[red]Web search timed out (took >90s, {result.web_credits_used} credit used), {num_web} chunks[/]")
         elif result.web_status == "api_failed":
-            console.print("[red]Web search failed (error), 0 results[/]")
+            console.print("[red]Web search failed (error), 0 chunks[/]")
         elif result.web_status == "no_key":
             console.print("[dim]Web search skipped (no API key)[/]")
         elif result.web_status == "max_calls":
             console.print("[dim]Web search skipped (max calls reached)[/]")
         else:
-            console.print(f"[dim]Web search: unknown status, {num_web} results[/]")
+            console.print(f"[dim]Web search: unknown status, {num_web} chunks[/]")
     else:
         console.print("[dim]Web search: not triggered[/]")
 

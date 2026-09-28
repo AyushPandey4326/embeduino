@@ -69,7 +69,7 @@ def mock_local_chunks():
 
 
 @pytest.fixture
-def mock_web_hits():
+def mock_web_hits(monkeypatch):
     """Web hits from SerpApi fixture as WebHit objects."""
     fixture_path = Path(__file__).parent / "fixtures" / "serpapi_uno_r4_response.json"
     fixture_data = json.loads(fixture_path.read_text())
@@ -77,13 +77,19 @@ def mock_web_hits():
     from embeduino.web_search import SerpApiSearcher
     import tempfile
     
+    # Mock _fetch_page to return None (use snippets only)
+    def mock_fetch(self, url):
+        return None
+    monkeypatch.setattr("embeduino.web_search.SerpApiSearcher._fetch_page", mock_fetch)
+    
     searcher = SerpApiSearcher(
         api_key="test",
         cache_dir=Path(tempfile.mkdtemp()),
         max_calls_per_run=10,
         timeout_s=90,
     )
-    hits = searcher._parse_results(fixture_data, num_results=5)
+    question = "What are the pin specifications for Arduino UNO R4 WiFi?"
+    hits = searcher._parse_results(fixture_data, num_results=5, question=question)
     return hits  # Return WebHit objects, not dicts
 
 
@@ -107,7 +113,7 @@ def mock_settings(tmp_path):
 
 
 def test_web_chunks_reach_citations_realistic_fusion(
-    mock_local_chunks, mock_web_hits, mock_settings
+    mock_local_chunks, mock_web_hits, mock_settings, monkeypatch
 ):
     """
     Regression test: Web chunks must survive RRF fusion with realistic local lists.
@@ -120,6 +126,11 @@ def test_web_chunks_reach_citations_realistic_fusion(
     """
     question = "What are the pin specifications for Arduino UNO R4 WiFi?"
     
+    # Mock page fetching to avoid network calls
+    def mock_fetch(self, url):
+        return None
+    monkeypatch.setattr("embeduino.web_search.SerpApiSearcher._fetch_page", mock_fetch)
+    
     # Mock VectorStore
     mock_store = MagicMock()
     mock_store.query.return_value = mock_local_chunks
@@ -130,9 +141,10 @@ def test_web_chunks_reach_citations_realistic_fusion(
         mock_searcher = MagicMock()
         mock_searcher.search.return_value = (
             mock_web_hits,  # Already WebHit objects
-            True,  # credit_used
+            1,  # credits_used (int)
             "api_success"
         )
+        mock_searcher._compute_score = lambda q, t: 0.6  # Mock score computation
         mock_searcher_class.return_value = mock_searcher
         
         result = ask(question, mock_store, mock_settings)
@@ -141,6 +153,7 @@ def test_web_chunks_reach_citations_realistic_fusion(
     assert result.answer != "I don't know", "Should answer with web chunks available"
     assert not result.weak_retrieval, "Should not be weak with web results"
     assert result.web_search_used, "Web search should have been triggered"
+    assert result.web_credits_used == 1, "Should have used 1 credit"
     
     # At least one web chunk must be in citations
     web_citations = [c for c in result.citations if c["origin"] == "web"]
@@ -213,12 +226,17 @@ def test_local_only_question_still_works(mock_local_chunks, mock_settings):
 
 
 def test_web_chunks_pass_weak_gate_with_lexical_overlap(
-    mock_local_chunks, mock_web_hits, mock_settings
+    mock_local_chunks, mock_web_hits, mock_settings, monkeypatch
 ):
     """
     Web chunks with decent lexical overlap should pass the weak gate.
     """
     question = "What are the technical specifications for the Arduino UNO R4 WiFi board?"
+    
+    # Mock page fetching
+    def mock_fetch(self, url):
+        return None
+    monkeypatch.setattr("embeduino.web_search.SerpApiSearcher._fetch_page", mock_fetch)
     
     mock_store = MagicMock()
     mock_store.query.return_value = mock_local_chunks
@@ -228,9 +246,10 @@ def test_web_chunks_pass_weak_gate_with_lexical_overlap(
         mock_searcher = MagicMock()
         mock_searcher.search.return_value = (
             mock_web_hits,
-            True,
+            1,  # credits_used
             "api_success"
         )
+        mock_searcher._compute_score = lambda q, t: 0.6
         mock_searcher_class.return_value = mock_searcher
         
         result = ask(question, mock_store, mock_settings)
@@ -238,6 +257,7 @@ def test_web_chunks_pass_weak_gate_with_lexical_overlap(
     # Should not be weak with web results that have lexical overlap
     assert not result.weak_retrieval, "Web chunks with lexical overlap should pass weak gate"
     assert result.web_search_used
+    assert result.web_credits_used == 1
     
     # Check that web chunks are in top results
     top_web = [h for h in result.retrieved[:4] if h.get("metadata", {}).get("chunk_type") == "web"]
@@ -245,12 +265,17 @@ def test_web_chunks_pass_weak_gate_with_lexical_overlap(
 
 
 def test_extractive_answer_uses_web_chunk_as_primary(
-    mock_local_chunks, mock_web_hits, mock_settings
+    mock_local_chunks, mock_web_hits, mock_settings, monkeypatch
 ):
     """
     Extractive answer should be able to use a web chunk as primary source.
     """
     question = "Where can I find the pinout diagram for Arduino UNO R4 WiFi?"
+    
+    # Mock page fetching
+    def mock_fetch(self, url):
+        return None
+    monkeypatch.setattr("embeduino.web_search.SerpApiSearcher._fetch_page", mock_fetch)
     
     mock_store = MagicMock()
     # Return low-relevance local chunks
@@ -263,26 +288,33 @@ def test_extractive_answer_uses_web_chunk_as_primary(
         mock_searcher = MagicMock()
         mock_searcher.search.return_value = (
             mock_web_hits,
-            True,
+            1,  # credits_used
             "api_success"
         )
+        mock_searcher._compute_score = lambda q, t: 0.7
         mock_searcher_class.return_value = mock_searcher
         
         result = ask(question, mock_store, mock_settings)
     
     # Answer should reference web source
     assert "forum.arduino.cc" in result.answer or "web" in result.answer.lower()
+    assert result.web_credits_used == 1
     
     # Top citation should be web
     assert result.citations[0]["origin"] == "web", "Top citation should be from web when web is most relevant"
     assert result.citations[0]["url"], "Top web citation must have URL"
 
 
-def test_zero_web_results_handled_gracefully(mock_local_chunks, mock_settings):
+def test_zero_web_results_handled_gracefully(mock_local_chunks, mock_settings, monkeypatch):
     """
     When web search returns 0 results, should still work with local chunks.
     """
     question = "What does analogRead do?"
+    
+    # Mock page fetching
+    def mock_fetch(self, url):
+        return None
+    monkeypatch.setattr("embeduino.web_search.SerpApiSearcher._fetch_page", mock_fetch)
     
     mock_store = MagicMock()
     mock_store.query.return_value = mock_local_chunks
@@ -290,7 +322,8 @@ def test_zero_web_results_handled_gracefully(mock_local_chunks, mock_settings):
     
     with patch("embeduino.rag.SerpApiSearcher") as mock_searcher_class:
         mock_searcher = MagicMock()
-        mock_searcher.search.return_value = ([], True, "api_success")  # 0 results
+        mock_searcher.search.return_value = ([], 1, "api_success")  # 0 results, 1 credit
+        mock_searcher._compute_score = lambda q, t: 0.5
         mock_searcher_class.return_value = mock_searcher
         
         result = ask(question, mock_store, mock_settings, web_mode_override="always")
@@ -298,6 +331,7 @@ def test_zero_web_results_handled_gracefully(mock_local_chunks, mock_settings):
     # Should still answer from local
     assert result.answer != "I don't know"
     assert result.web_search_used
+    assert result.web_credits_used == 1
     
     # All citations should be local
     web_citations = [c for c in result.citations if c["origin"] == "web"]

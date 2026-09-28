@@ -29,7 +29,7 @@ class AskResult:
     retrieved: List[Dict[str, Any]] = field(default_factory=list)
     weak_retrieval: bool = False
     web_search_used: bool = False
-    web_credit_used: bool = False
+    web_credits_used: int = 0  # Changed from bool to int
     web_status: str = ""
 
 
@@ -345,7 +345,7 @@ def ask(
     
     # 3. Decide whether to use web search
     web_search_used = False
-    web_credit_used = False
+    web_credits_used = 0
     web_status = ""
     web_hits_raw = []
     
@@ -359,19 +359,21 @@ def ask(
             cache_dir=settings.serp_cache,
             max_calls_per_run=settings.serp_max_calls,
             timeout_s=settings.serp_timeout_s,
+            trusted_domains=settings.web_sites,
         )
-        web_results, credit_used, status = searcher.search(
+        web_results, credits_used, status = searcher.search(
             question,
             trusted_sites=settings.web_sites,
             num_results=settings.web_num,
         )
-        web_hits_raw = [w.to_dict() for w in web_results]
+        # Convert WebHit objects to dicts with computed scores
+        web_hits_raw = [w.to_dict(score=searcher._compute_score(question, w.text)) for w in web_results]
         web_search_used = True
-        web_credit_used = credit_used
+        web_credits_used = credits_used
         web_status = status
         logger.info(
-            "Web search: %d results parsed, status=%s, credit_used=%s",
-            len(web_hits_raw), status, credit_used
+            "Web search: %d web chunks parsed, status=%s, credits_used=%d",
+            len(web_hits_raw), status, credits_used
         )
     
     # 4. Combine and rerank: vector + web through same reranker
@@ -417,7 +419,7 @@ def ask(
             retrieved=hits,
             weak_retrieval=True,
             web_search_used=web_search_used,
-            web_credit_used=web_credit_used,
+            web_credits_used=web_credits_used,
             web_status=web_status,
         )
     
@@ -438,6 +440,6 @@ def ask(
         retrieved=hits,
         weak_retrieval=False,
         web_search_used=web_search_used,
-        web_credit_used=web_credit_used,
+        web_credits_used=web_credits_used,
         web_status=web_status,
     )
