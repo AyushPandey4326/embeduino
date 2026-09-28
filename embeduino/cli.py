@@ -155,20 +155,24 @@ def ask_cmd(
     console.print(Panel(result.answer, title="Answer", border_style=style))
     
     if result.web_search_used:
+        num_web = sum(
+            1 for h in result.retrieved
+            if h.get("metadata", {}).get("chunk_type") == "web"
+        )
         if result.web_status == "cache_hit":
-            console.print("[green]Web search served from cache (0 SerpApi credits)[/]")
+            console.print(f"[green]Web search served from cache (0 SerpApi credits), {num_web} results[/]")
         elif result.web_status == "api_success" and result.web_credit_used:
-            console.print("[yellow]Web search used (1 SerpApi credit)[/]")
+            console.print(f"[yellow]Web search used (1 SerpApi credit), {num_web} results[/]")
         elif result.web_status == "timeout":
-            console.print("[red]Web search timed out (took >90s, 1 credit used)[/]")
+            console.print(f"[red]Web search timed out (took >90s, 1 credit used), {num_web} results[/]")
         elif result.web_status == "api_failed":
-            console.print("[red]Web search failed (error)[/]")
+            console.print("[red]Web search failed (error), 0 results[/]")
         elif result.web_status == "no_key":
             console.print("[dim]Web search skipped (no API key)[/]")
         elif result.web_status == "max_calls":
             console.print("[dim]Web search skipped (max calls reached)[/]")
         else:
-            console.print("[dim]Web search: unknown status[/]")
+            console.print(f"[dim]Web search: unknown status, {num_web} results[/]")
     else:
         console.print("[dim]Web search: not triggered[/]")
 

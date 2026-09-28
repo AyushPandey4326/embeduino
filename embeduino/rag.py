@@ -170,18 +170,27 @@ def _is_weak(question: str, hits: List[Dict[str, Any]], min_score: float) -> boo
         return True
     best = hits[0]
     
+    # Check if we have web chunks in top results
     has_web = any(h.get("metadata", {}).get("chunk_type") == "web" for h in hits[:3])
     
     best_score = float(best.get("score", 0.0))
     best_rrf = float(best.get("rrf_score", 0.0))
+    best_lex = float(best.get("lex_overlap", 0.0))
     
-    if has_web and best_rrf > 0.01:
+    # Web chunks with decent lexical overlap should pass
+    if has_web and best_lex >= 0.20 and best_rrf > 0.01:
+        logger.info("Accepting web chunks: lex=%.2f rrf=%.3f", best_lex, best_rrf)
+        return False
+    
+    # Web chunks with good RRF score should pass even with lower lex
+    if has_web and best_rrf > 0.025:
+        logger.info("Accepting web chunks: rrf=%.3f", best_rrf)
         return False
     
     if best_score < min_score:
         return True
     
-    if float(best.get("lex_overlap", 0.0)) < 0.15 and best_score < 0.45:
+    if best_lex < 0.15 and best_score < 0.45:
         return True
     
     q_terms = _tokens(question)
@@ -329,23 +338,19 @@ def ask(
     
     # 1. Vector retrieval
     raw_vector = store.query(question, top_k=max(settings.top_k * 3, 12))
-    vector_ranked = _rerank(question, raw_vector)
     
-    # 2. BM25 retrieval
-    all_chunks = store.get_all_chunks()
-    bm25_ranked = bm25_rank(question, all_chunks) if all_chunks else []
+    # 2. Check if local retrieval is weak (before reranking)
+    temp_reranked = _rerank(question, raw_vector)
+    local_weak = _is_weak(question, temp_reranked, settings.min_score)
     
-    # 3. Check if local retrieval is weak
-    local_weak = _is_weak(question, vector_ranked, settings.min_score)
-    
-    # 4. Decide whether to use web search
+    # 3. Decide whether to use web search
     web_search_used = False
     web_credit_used = False
     web_status = ""
-    web_hits = []
+    web_hits_raw = []
     
     trigger_web = should_trigger_web_search(
-        question, vector_ranked, local_weak, effective_web_mode
+        question, temp_reranked, local_weak, effective_web_mode
     )
     
     if trigger_web and settings.serpapi_api_key:
@@ -360,19 +365,33 @@ def ask(
             trusted_sites=settings.web_sites,
             num_results=settings.web_num,
         )
-        web_hits = [w.to_dict() for w in web_results]
+        web_hits_raw = [w.to_dict() for w in web_results]
         web_search_used = True
         web_credit_used = credit_used
         web_status = status
         logger.info(
-            "Web search: %d results, status=%s, credit_used=%s",
-            len(web_hits), status, credit_used
+            "Web search: %d results parsed, status=%s, credit_used=%s",
+            len(web_hits_raw), status, credit_used
         )
     
-    # 5. Reciprocal Rank Fusion
+    # 4. Combine and rerank: vector + web through same reranker
+    # This ensures web chunks get rerank scores and can compete fairly
+    combined_for_rerank = list(raw_vector)
+    if web_hits_raw:
+        combined_for_rerank.extend(web_hits_raw)
+    
+    vector_ranked = _rerank(question, combined_for_rerank)
+    
+    # 5. BM25 retrieval over local + web combined pool
+    # This ensures web chunks appear in BM25 list too
+    all_chunks = store.get_all_chunks()
+    if web_hits_raw:
+        all_chunks = list(all_chunks) + web_hits_raw
+    bm25_ranked = bm25_rank(question, all_chunks) if all_chunks else []
+    
+    # 6. Reciprocal Rank Fusion
+    # Now web chunks appear in both vector_ranked and bm25_ranked, fixing the structural bias
     ranked_lists = [vector_ranked, bm25_ranked]
-    if web_hits:
-        ranked_lists.append(web_hits)
     
     fused = reciprocal_rank_fusion(ranked_lists, k=settings.rrf_k)
     hits = fused[: settings.top_k]
