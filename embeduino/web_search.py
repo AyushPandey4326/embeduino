@@ -18,6 +18,29 @@ from bs4 import BeautifulSoup
 logger = logging.getLogger(__name__)
 
 
+ARDUINO_PRODUCT_SLUGS = {
+    "uno r4 wifi": "uno-r4-wifi",
+    "uno r4 minima": "uno-r4-minima",
+    "uno r3": "uno-rev3",
+    "uno rev3": "uno-rev3",
+    "nano": "nano",
+    "nano 33 ble": "nano-33-ble",
+    "nano esp32": "nano-esp32",
+    "nano every": "nano-every",
+    "mega 2560": "mega-2560",
+    "leonardo": "leonardo",
+}
+
+
+def _detect_arduino_product(question: str) -> Optional[str]:
+    """Detect Arduino product name in question and return hardware slug."""
+    question_lower = question.lower()
+    for product_name, slug in ARDUINO_PRODUCT_SLUGS.items():
+        if product_name in question_lower:
+            return slug
+    return None
+
+
 @dataclass
 class WebHit:
     """A web search result converted to a retrievable chunk."""
@@ -190,6 +213,17 @@ class SerpApiSearcher:
             if len(text) > 10000:
                 text = text[:10000]
             
+            # Generic Gatsby fallback: if HTML extraction yields <150 chars and it's docs.arduino.cc, try page-data
+            if len(text) < 150 and "docs.arduino.cc" in url:
+                # Skip non-English paths
+                parsed = urlparse(url)
+                if "/pt/" not in parsed.path and "fun%C3%A7%C3%B5es" not in parsed.path and "/es/" not in parsed.path:
+                    logger.debug("Short HTML (%d chars), trying Gatsby page-data fallback for %s", len(text), url)
+                    gatsby_content = self._fetch_gatsby_page_data(url)
+                    if gatsby_content and len(gatsby_content) > len(text):
+                        logger.info("Gatsby fallback successful: %d chars vs %d HTML chars", len(gatsby_content), len(text))
+                        text = gatsby_content
+            
             # Cache it
             try:
                 cache_file.write_text(text, encoding="utf-8")
@@ -209,18 +243,18 @@ class SerpApiSearcher:
         
         Extracts techspecs from result.data.techspecs.fields.content
         and converts YAML-like structure to readable "Section - Key: Value" lines.
+        Also works for any docs.arduino.cc page with mdx content.
         """
         try:
-            # Extract slug from URL: docs.arduino.cc/hardware/uno-r4-wifi/ → uno-r4-wifi
+            # Extract path from URL
             parsed = urlparse(url)
-            path = parsed.path.rstrip('/')
-            # Remove /hardware/ prefix
-            if '/hardware/' in path:
-                slug = path.split('/hardware/')[-1]
-            else:
+            path = parsed.path.rstrip('/').lstrip('/')
+            
+            # Skip non-English paths
+            if '/pt/' in path or '/es/' in path or 'fun%C3%A7%C3%B5es' in path:
                 return None
             
-            page_data_url = f"https://docs.arduino.cc/page-data/hardware/{slug}/page-data.json"
+            page_data_url = f"https://docs.arduino.cc/page-data/{path}/page-data.json"
             
             logger.debug("Fetching Gatsby page-data: %s", page_data_url)
             resp = httpx.get(
@@ -238,12 +272,13 @@ class SerpApiSearcher:
             child_mdx = product.get("childMdx", {})
             excerpt = child_mdx.get("excerpt", "")
             
-            # Extract techspecs
+            # Extract techspecs (for hardware pages)
             techspecs = result_data.get("techspecs", {})
             techspecs_content = techspecs.get("fields", {}).get("content", "")
             
-            if not techspecs_content:
-                logger.warning("No techspecs found in page-data for %s", url)
+            if not techspecs_content and not excerpt:
+                # Try to get any content field
+                logger.debug("No techspecs or excerpt found in page-data for %s", url)
                 return None
             
             # Parse YAML-like techspecs into "Section - Key: Value" lines
@@ -252,32 +287,34 @@ class SerpApiSearcher:
                 lines.append(excerpt)
                 lines.append("")
             
-            current_section = ""
-            for line in techspecs_content.split("\n"):
-                line = line.rstrip()
-                if not line:
-                    continue
-                
-                # Section header (no leading spaces, ends with :)
-                if not line.startswith(" ") and line.endswith(":"):
-                    current_section = line.rstrip(":")
-                # Key-value pair (leading spaces)
-                elif line.startswith(" ") and ":" in line:
-                    # Parse "  Key: Value"
-                    key_value = line.strip()
-                    if ":" in key_value:
-                        key, value = key_value.split(":", 1)
-                        key = key.strip()
-                        value = value.strip()
-                        # Make self-contained: "Section - Key: Value"
-                        if current_section:
-                            lines.append(f"{current_section} - {key}: {value}")
-                        else:
-                            lines.append(f"{key}: {value}")
+            if techspecs_content:
+                current_section = ""
+                for line in techspecs_content.split("\n"):
+                    line = line.rstrip()
+                    if not line:
+                        continue
+                    
+                    # Section header (no leading spaces, ends with :)
+                    if not line.startswith(" ") and line.endswith(":"):
+                        current_section = line.rstrip(":")
+                    # Key-value pair (leading spaces)
+                    elif line.startswith(" ") and ":" in line:
+                        # Parse "  Key: Value"
+                        key_value = line.strip()
+                        if ":" in key_value:
+                            key, value = key_value.split(":", 1)
+                            key = key.strip()
+                            value = value.strip()
+                            # Make self-contained: "Section - Key: Value"
+                            if current_section:
+                                lines.append(f"{current_section} - {key}: {value}")
+                            else:
+                                lines.append(f"{key}: {value}")
             
             content = "\n".join(lines)
-            logger.info("Fetched %d chars from Gatsby page-data for %s", len(content), url)
-            return content
+            if content:
+                logger.info("Fetched %d chars from Gatsby page-data for %s", len(content), url)
+            return content if content else None
             
         except Exception as e:
             logger.warning("Failed to fetch Gatsby page-data for %s: %s", url, e)
@@ -437,10 +474,42 @@ class SerpApiSearcher:
         Uses as_sitesearch parameter for reliable site filtering.
         Checks search_information for query rewrites.
         """
+        # Direct product-page resolution for known Arduino boards
+        direct_hits = []
+        product_slug = _detect_arduino_product(question)
+        if product_slug:
+            hardware_url = f"https://docs.arduino.cc/hardware/{product_slug}/"
+            logger.info("Detected Arduino product '%s', fetching page-data directly", product_slug)
+            content = self._fetch_gatsby_page_data(hardware_url)
+            if content:
+                chunks = self._chunk_page_content(content, hardware_url, f"Arduino {product_slug}")
+                for i, chunk_text in enumerate(chunks):
+                    hit_id = f"web:direct:{hashlib.sha1(f'{hardware_url}:{i}'.encode()).hexdigest()[:12]}"
+                    text = f"Arduino {product_slug}\n\n{chunk_text}"
+                    score = self._compute_score(question, text, hardware_url)
+                    direct_hits.append(
+                        WebHit(
+                            id=hit_id,
+                            text=text,
+                            url=hardware_url,
+                            title=f"Arduino {product_slug}",
+                            position=0.5 + i * 0.1,
+                            snippet=f"Direct hardware page for {product_slug}",
+                            fetched_content=chunk_text,
+                        )
+                    )
+                logger.info("Direct product fetch: retrieved %d chunks from %s", len(direct_hits), hardware_url)
+        
         query = _build_keyword_query(question)
         
-        # Use SerpApi's as_sitesearch parameter for the preferred domain
-        preferred_site = trusted_sites[0] if prefer_docs and trusted_sites else None
+        # For spec/pinout/datasheet questions, use path-scoped docs.arduino.cc/hardware
+        is_spec_question = any(kw in question.lower() for kw in ["spec", "pinout", "datasheet", "pin", "voltage", "current"])
+        preferred_site = None
+        if prefer_docs and trusted_sites:
+            if is_spec_question and any("docs.arduino.cc" in site for site in trusted_sites):
+                preferred_site = "docs.arduino.cc/hardware"
+            else:
+                preferred_site = trusted_sites[0]
         
         params = {
             "engine": "google",
@@ -458,18 +527,19 @@ class SerpApiSearcher:
         if cached is not None:
             logger.info("SerpApi: served from cache (key=%s)", cache_key[:8])
             hits = self._parse_results(cached, num_results, question)
-            return hits, 0, "cache_hit"
+            # Combine with direct hits
+            return direct_hits + hits, 0, "cache_hit"
         
         if self.calls_made >= self.max_calls:
             logger.warning(
                 "SerpApi: max calls reached (%d/%d), skipping",
                 self.calls_made, self.max_calls
             )
-            return [], 0, "max_calls"
+            return direct_hits, 0, "max_calls"
         
         if not self.api_key:
             logger.warning("SerpApi: no API key set, skipping")
-            return [], 0, "no_key"
+            return direct_hits, 0, "no_key"
         
         url = "https://serpapi.com/search"
         params["api_key"] = self.api_key
@@ -520,9 +590,9 @@ class SerpApiSearcher:
                         fallback_hits, fallback_credits, fallback_status = self._fallback_search(query, trusted_sites, num_results, question)
                         credits_used += fallback_credits
                         if len(fallback_hits) > len(hits):
-                            return fallback_hits, credits_used, "api_success"
+                            return direct_hits + fallback_hits, credits_used, "api_success"
                     
-                    return hits, credits_used, "api_success"
+                    return direct_hits + hits, credits_used, "api_success"
                 elif poll_status == "timeout":
                     return [], credits_used, "timeout"
                 else:
@@ -546,12 +616,12 @@ class SerpApiSearcher:
                     fallback_hits, fallback_credits, fallback_status = self._fallback_search(query, trusted_sites, num_results, question)
                     credits_used += fallback_credits
                     if len(fallback_hits) > len(hits):
-                        return fallback_hits, credits_used, "api_success"
+                        return direct_hits + fallback_hits, credits_used, "api_success"
                 
-                return hits, credits_used, "api_success"
+                return direct_hits + hits, credits_used, "api_success"
         except Exception as e:
             logger.error("SerpApi call failed: %s", e)
-            return [], credits_used, "api_failed"
+            return direct_hits, credits_used, "api_failed"
     
     def _fallback_search(
         self, query: str, trusted_sites: List[str], num_results: int, question: str

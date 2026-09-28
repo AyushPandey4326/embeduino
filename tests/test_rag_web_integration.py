@@ -432,3 +432,160 @@ def test_gatsby_page_data_extraction_with_fixture(mock_local_chunks, mock_settin
     # Verify answer is substantive (not empty or "I don't know")
     assert len(result.answer) > 200, f"Answer should be substantive, got {len(result.answer)} chars"
     assert "I don't know" not in result.answer, "Answer should not be 'I don't know'"
+
+
+def test_direct_product_resolution_with_junk_serpapi(mock_local_chunks, mock_settings, monkeypatch):
+    """
+    Test direct product-page resolution when SerpApi returns junk language-reference pages.
+    
+    Simulates real Windows failure where SerpApi returned:
+    - https://docs.arduino.cc/language-reference/funções/wifi/overview/
+    - https://docs.arduino.cc/language-reference/pt/funções/communication/wire
+    
+    The direct product resolution should fetch the hardware page-data.json and return
+    a complete answer with pin specs.
+    """
+    question = "What are the pin specifications for Arduino UNO R4 WiFi?"
+    
+    # Load page-data fixture for UNO R4 WiFi
+    fixture_path = Path(__file__).parent / "fixtures" / "uno_r4_wifi_page_data.json"
+    page_data_fixture = json.loads(fixture_path.read_text())
+    
+    # Store original httpx.get before patching
+    import httpx
+    real_httpx_get = httpx.get
+    
+    # Mock httpx to return junk SerpApi results but real page-data
+    def mock_httpx_get(url, **kwargs):
+        if "serpapi.com/search" in url:
+            # Initial async request
+            mock_resp = MagicMock()
+            if "async=true" in str(kwargs.get("params", {})) or ("params" in kwargs and kwargs["params"].get("async") == "true"):
+                mock_resp.json.return_value = {
+                    "search_metadata": {"id": "mock_junk_123", "status": "Success"},
+                }
+            else:
+                # Return junk results
+                mock_resp.json.return_value = {
+                    "search_metadata": {"id": "mock_junk_123", "status": "Success"},
+                    "search_information": {"query_displayed": question},
+                    "organic_results": [
+                        {
+                            "position": 1,
+                            "title": "WiFi Overview",
+                            "link": "https://docs.arduino.cc/language-reference/funções/wifi/overview/",
+                            "snippet": "WiFi functions",
+                        },
+                        {
+                            "position": 2,
+                            "title": "Wire Communication",
+                            "link": "https://docs.arduino.cc/language-reference/pt/funções/communication/wire",
+                            "snippet": "Wire library",
+                        }
+                    ]
+                }
+            mock_resp.raise_for_status = lambda: None
+            return mock_resp
+        elif "searches/mock_junk_123.json" in url:
+            # Poll response
+            mock_resp = MagicMock()
+            mock_resp.json.return_value = {
+                "search_metadata": {"id": "mock_junk_123", "status": "Success"},
+                "search_information": {"query_displayed": question},
+                "organic_results": [
+                    {
+                        "position": 1,
+                        "title": "WiFi Overview",
+                        "link": "https://docs.arduino.cc/language-reference/funções/wifi/overview/",
+                        "snippet": "WiFi functions",
+                    },
+                    {
+                        "position": 2,
+                        "title": "Wire Communication",
+                        "link": "https://docs.arduino.cc/language-reference/pt/funções/communication/wire",
+                        "snippet": "Wire library",
+                    }
+                ]
+            }
+            mock_resp.raise_for_status = lambda: None
+            return mock_resp
+        elif "page-data.json" in url and "/hardware/uno-r4-wifi/" in url:
+            # Return real page-data fixture for hardware page
+            mock_resp = MagicMock()
+            mock_resp.json.return_value = page_data_fixture
+            mock_resp.raise_for_status = lambda: None
+            return mock_resp
+        elif "language-reference" in url:
+            # Junk language-reference pages return short HTML
+            mock_resp = MagicMock()
+            mock_resp.headers = {"content-type": "text/html"}
+            mock_resp.content = b"<html><body>WiFi functions</body></html>"
+            mock_resp.raise_for_status = lambda: None
+            return mock_resp
+        else:
+            # Use real httpx for any other URLs
+            return real_httpx_get(url, **kwargs)
+    
+    monkeypatch.setattr("embeduino.web_search.httpx.get", mock_httpx_get)
+    
+    # Mock VectorStore
+    mock_store = MagicMock()
+    mock_store.query.return_value = mock_local_chunks
+    mock_store.get_all_chunks.return_value = mock_local_chunks
+    
+    # Use real searcher with mocked httpx
+    from embeduino.web_search import SerpApiSearcher
+    import tempfile
+    
+    searcher = SerpApiSearcher(
+        api_key="test_key",
+        cache_dir=Path(tempfile.mkdtemp()),
+        max_calls_per_run=10,
+        timeout_s=90,
+    )
+    
+    # This should:
+    # 1. Detect "UNO R4 WiFi" and fetch hardware page-data directly
+    # 2. SerpApi returns junk language-reference pages (filtered out)
+    # 3. Direct product fetch provides the specs
+    web_hits, credits, status = searcher.search(
+        question,
+        trusted_sites=["docs.arduino.cc"],
+        num_results=5,
+    )
+    
+    # Should have direct hits from product resolution
+    assert len(web_hits) > 0, "Should have web hits from direct product resolution"
+    
+    # Check that at least one hit is from hardware page
+    hardware_hits = [h for h in web_hits if "/hardware/uno-r4-wifi/" in h.url]
+    assert len(hardware_hits) > 0, "Should have hardware page hit from direct resolution"
+    
+    # Check that hardware hit contains specs
+    hardware_text = " ".join(h.text for h in hardware_hits)
+    assert "Pins - Digital I/O Pins: 14" in hardware_text, "Hardware hit should contain pin spec"
+    assert "Power - DC Current per I/O Pin: 8 mA" in hardware_text, "Hardware hit should contain current spec"
+    
+    # Now run full pipeline
+    with patch("embeduino.rag.SerpApiSearcher") as mock_searcher_class:
+        mock_searcher_class.return_value = searcher
+        result = ask(question, mock_store, mock_settings, web_mode_override="always")
+    
+    # Verify answer quality
+    answer = result.answer
+    answer_lower = answer.lower()
+    
+    # Must contain all key specs in main answer body
+    assert "14" in answer, f"Answer should mention 14 digital I/O pins. Got: {answer}"
+    assert "pwm pins: 6" in answer_lower or "pwm: 6" in answer_lower, f"Answer should mention 6 PWM pins. Got: {answer}"
+    assert "5 v" in answer_lower, f"Answer should mention 5 V operating voltage. Got: {answer}"
+    assert "6-24 v" in answer_lower or "6-24v" in answer_lower or "vin" in answer_lower, f"Answer should mention 6-24 V VIN. Got: {answer}"
+    assert "8 ma" in answer_lower or "8ma" in answer_lower, f"Answer should mention 8 mA current. Got: {answer}"
+    
+    # Must cite hardware page
+    web_citations = [c for c in result.citations if c["origin"] == "web"]
+    assert any("docs.arduino.cc/hardware/uno-r4-wifi" in c["url"] for c in web_citations), "Should cite hardware page"
+    
+    # Should not be weak or "I don't know"
+    assert not result.weak_retrieval, "Should not be weak with direct product hit"
+    assert "I don't know" not in answer, "Answer should not be 'I don't know'"

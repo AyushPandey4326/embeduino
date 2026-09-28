@@ -237,6 +237,10 @@ def _extractive_answer(question: str, hits: List[Dict[str, Any]]) -> str:
     
     # Choose primary chunk by best rerank or RRF score across ALL sources
     # If question mentions a product not in local chunks, prefer best web chunk
+    # For spec questions, prefer chunks with many spec lines
+    spec_keywords = {'pin', 'voltage', 'current', 'power', 'specification', 'spec', 'communication', 'uart', 'i2c', 'spi', 'pinout', 'datasheet'}
+    is_spec_question = any(kw in question.lower() for kw in spec_keywords)
+    
     best_chunk = None
     best_score = -1.0
     
@@ -249,6 +253,13 @@ def _extractive_answer(question: str, hits: List[Dict[str, Any]]) -> str:
         # Boost web chunks if question mentions product not in local
         if is_web and mentioned_products and not local_has_product:
             score += 0.1
+        
+        # For spec questions, boost chunks with many spec lines
+        if is_spec_question:
+            text = h.get("text", "")
+            spec_line_count = len(re.findall(r'^(Pins|Power|Communication|Memory|Clock) - ', text, re.MULTILINE))
+            if spec_line_count >= 5:
+                score += 0.2  # Boost chunks rich in spec lines
         
         if score > best_score:
             best_score = score
@@ -291,8 +302,13 @@ def _extractive_answer(question: str, hits: List[Dict[str, Any]]) -> str:
         """Extract most relevant sentences from chunk based on question overlap."""
         text = h.get("text") or ""
         
+        # Check if this is a spec question and chunk has many spec lines
+        spec_keywords = {'pin', 'voltage', 'current', 'power', 'specification', 'spec', 'communication', 'uart', 'i2c', 'spi', 'pinout', 'datasheet'}
+        is_spec_question = any(kw in question.lower() for kw in spec_keywords)
+        
         # Split into sentences/lines
         sentences = []
+        spec_lines = []
         for para in re.split(r"\n\s*\n", text):
             para = para.strip()
             if not para or (re.match(r"^#{1,6}\s+", para) and len(para) < 60):
@@ -303,6 +319,9 @@ def _extractive_answer(question: str, hits: List[Dict[str, Any]]) -> str:
             if re.match(r'^[A-Z][a-zA-Z\s]+ - [^:]+:\s*.+$', para):
                 # Spec line, treat as single sentence
                 sentences.append(para)
+                # Track spec lines separately for formatting
+                if re.match(r'^(Pins|Power|Communication|Memory|Clock|USB|Board|Microcontroller) - ', para):
+                    spec_lines.append(para)
             else:
                 # Split on sentence boundaries
                 for sent in re.split(r'[.!?]\s+', para):
@@ -313,7 +332,26 @@ def _extractive_answer(question: str, hits: List[Dict[str, Any]]) -> str:
         if not sentences:
             return text[:700]
         
-        # Score sentences by overlap with question
+        # For spec questions with many spec lines, format as bullet list
+        if is_spec_question and len(spec_lines) >= 5:
+            # Group spec lines by section
+            pins_lines = [l for l in spec_lines if l.startswith("Pins -")]
+            power_lines = [l for l in spec_lines if l.startswith("Power -")]
+            comm_lines = [l for l in spec_lines if l.startswith("Communication -")]
+            other_lines = [l for l in spec_lines if not any(l.startswith(p) for p in ["Pins -", "Power -", "Communication -"])]
+            
+            # Format as bullet list, keeping only key: value part
+            formatted = []
+            for line in pins_lines + power_lines + comm_lines + other_lines[:3]:
+                # Extract "Key: Value" from "Section - Key: Value"
+                if " - " in line:
+                    key_val = line.split(" - ", 1)[1]
+                    formatted.append(f"• {key_val}")
+            
+            if formatted:
+                return "\n".join(formatted)
+        
+        # Standard sentence extraction with overlap scoring
         q_terms = _tokens(question)
         scored = []
         for sent in sentences:
@@ -324,9 +362,7 @@ def _extractive_answer(question: str, hits: List[Dict[str, Any]]) -> str:
                 # Boost spec lines for pin/power/communication questions
                 boost = 0.0
                 if re.match(r'^(Pins|Power|Communication|Memory|Clock) - ', sent):
-                    # Check if question is about specs
-                    spec_keywords = {'pin', 'voltage', 'current', 'power', 'specification', 'spec', 'communication', 'uart', 'i2c', 'spi'}
-                    if any(kw in question.lower() for kw in spec_keywords):
+                    if is_spec_question:
                         boost = 0.3
                 
                 scored.append((overlap + boost, sent))
