@@ -79,7 +79,7 @@ def test_serpapi_no_api_key(tmp_path):
         max_calls_per_run=10,
     )
     
-    hits, credit_used = searcher.search(
+    hits, credit_used, status = searcher.search(
         "test question",
         trusted_sites=["docs.arduino.cc"],
         num_results=5,
@@ -87,6 +87,7 @@ def test_serpapi_no_api_key(tmp_path):
     
     assert hits == []
     assert credit_used is False
+    assert status == "no_key"
 
 
 def test_should_trigger_web_search_modes():
@@ -153,9 +154,94 @@ def test_serpapi_max_calls(mock_serp_response, tmp_path, monkeypatch):
     
     searcher.calls_made = 2
     
-    hits, credit_used = searcher.search(
+    hits, credit_used, status = searcher.search(
         "test", ["docs.arduino.cc"], num_results=5
     )
     
     assert hits == []
     assert credit_used is False
+    assert status == "max_calls"
+
+
+def test_web_chunks_survive_to_answer_context(tmp_path):
+    """Regression test: web chunks with URLs must reach final answer context."""
+    import json
+    from pathlib import Path
+    
+    fixture_path = Path(__file__).parent / "fixtures" / "serpapi_uno_r4_response.json"
+    fixture_data = json.loads(fixture_path.read_text())
+    
+    searcher = SerpApiSearcher(
+        api_key="test_key",
+        cache_dir=tmp_path,
+        max_calls_per_run=10,
+    )
+    
+    from embeduino.web_search import _build_keyword_query
+    query = _build_keyword_query("What are the pin specifications for Arduino UNO R4 WiFi?")
+    full_query = f"{query} site:docs.arduino.cc"
+    params = {"engine": "google", "hl": "en", "gl": "us", "num": 5}
+    cache_key = searcher._cache_key(full_query, params)
+    searcher._write_cache(cache_key, fixture_data)
+    
+    hits, credit_used, status = searcher.search(
+        "What are the pin specifications for Arduino UNO R4 WiFi?",
+        trusted_sites=["docs.arduino.cc", "github.com", "forum.arduino.cc"],
+        num_results=5,
+    )
+    
+    assert status == "cache_hit"
+    assert credit_used is False
+    assert len(hits) == 3
+    assert all(hit.url for hit in hits)
+    assert all(hit.title for hit in hits)
+    
+    chunks = [h.to_dict() for h in hits]
+    assert all(c["metadata"]["chunk_type"] == "web" for c in chunks)
+    assert all("url" in c["metadata"] for c in chunks)
+    assert all(c["score"] >= 0.5 for c in chunks)
+    assert all(c["rerank_score"] >= 0.5 for c in chunks)
+    
+    for c in chunks:
+        assert "forum.arduino.cc" in c["metadata"]["url"]
+
+
+def test_keyword_query_building():
+    """Keyword extraction should strip question words."""
+    from embeduino.web_search import _build_keyword_query
+    
+    q1 = "What are the pin specifications for Arduino UNO R4 WiFi?"
+    k1 = _build_keyword_query(q1)
+    assert "what" not in k1.lower()
+    assert "are" not in k1.lower()
+    assert "pin" in k1.lower()
+    assert "arduino" in k1.lower()
+    
+    q2 = "How do I use digitalWrite with ESP32?"
+    k2 = _build_keyword_query(q2)
+    assert "how" not in k2.lower()
+    assert "digitalwrite" in k2.lower() or "digital" in k2.lower()
+    assert "esp32" in k2.lower()
+
+
+def test_api_failure_status(tmp_path, monkeypatch):
+    """Failed API call should return api_failed status."""
+    def mock_get(*args, **kwargs):
+        import httpx
+        raise httpx.TimeoutException("Mock timeout")
+    
+    monkeypatch.setattr("httpx.get", mock_get)
+    
+    searcher = SerpApiSearcher(
+        api_key="fake_key",
+        cache_dir=tmp_path,
+        max_calls_per_run=10,
+    )
+    
+    hits, credit_used, status = searcher.search(
+        "test", ["docs.arduino.cc"], num_results=5
+    )
+    
+    assert hits == []
+    assert credit_used is False
+    assert status == "api_failed"

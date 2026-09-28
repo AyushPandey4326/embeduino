@@ -30,6 +30,7 @@ class AskResult:
     weak_retrieval: bool = False
     web_search_used: bool = False
     web_credit_used: bool = False
+    web_status: str = ""
 
 
 def _tokens(text: str) -> Set[str]:
@@ -168,18 +169,27 @@ def _is_weak(question: str, hits: List[Dict[str, Any]], min_score: float) -> boo
     if not hits:
         return True
     best = hits[0]
-    if float(best.get("score", 0.0)) < min_score:
+    
+    has_web = any(h.get("metadata", {}).get("chunk_type") == "web" for h in hits[:3])
+    
+    best_score = float(best.get("score", 0.0))
+    best_rrf = float(best.get("rrf_score", 0.0))
+    
+    if has_web and best_rrf > 0.01:
+        return False
+    
+    if best_score < min_score:
         return True
-    # Out-of-domain: embedding may still fire weakly; require some lexical support
-    if float(best.get("lex_overlap", 0.0)) < 0.15 and float(best.get("score", 0.0)) < 0.45:
+    
+    if float(best.get("lex_overlap", 0.0)) < 0.15 and best_score < 0.45:
         return True
-    # Domain-ish query terms must appear somewhere in top hits
+    
     q_terms = _tokens(question)
     content_terms = set()
     for h in hits[:3]:
         content_terms |= _tokens(h.get("text") or "")
-    # Drop API-ish tokens that appear in many docs (arduino, pin, etc. alone not enough)
-    distinctive = q_terms - {"arduino", "board", "sketch", "code", "function", "use", "using"}
+    
+    distinctive = q_terms - {"arduino", "board", "sketch", "code", "function", "use", "using", "pin", "pins"}
     if distinctive and len(distinctive & content_terms) / len(distinctive) < 0.2:
         return True
     return False
@@ -331,6 +341,7 @@ def ask(
     # 4. Decide whether to use web search
     web_search_used = False
     web_credit_used = False
+    web_status = ""
     web_hits = []
     
     trigger_web = should_trigger_web_search(
@@ -343,7 +354,7 @@ def ask(
             cache_dir=settings.serp_cache,
             max_calls_per_run=settings.serp_max_calls,
         )
-        web_results, credit_used = searcher.search(
+        web_results, credit_used, status = searcher.search(
             question,
             trusted_sites=settings.web_sites,
             num_results=settings.web_num,
@@ -351,9 +362,10 @@ def ask(
         web_hits = [w.to_dict() for w in web_results]
         web_search_used = True
         web_credit_used = credit_used
+        web_status = status
         logger.info(
-            "Web search: %d results, credit_used=%s",
-            len(web_hits), credit_used
+            "Web search: %d results, status=%s, credit_used=%s",
+            len(web_hits), status, credit_used
         )
     
     # 5. Reciprocal Rank Fusion
@@ -386,6 +398,7 @@ def ask(
             weak_retrieval=True,
             web_search_used=web_search_used,
             web_credit_used=web_credit_used,
+            web_status=web_status,
         )
     
     # 7. Generate answer
@@ -406,4 +419,5 @@ def ask(
         weak_retrieval=False,
         web_search_used=web_search_used,
         web_credit_used=web_credit_used,
+        web_status=web_status,
     )

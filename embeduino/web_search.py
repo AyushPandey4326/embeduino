@@ -36,7 +36,9 @@ class WebHit:
                 "chunk_type": "web",
                 "position": self.position,
             },
-            "score": 0.0,
+            "score": 0.5,
+            "lex_overlap": 0.0,
+            "rerank_score": 0.5,
         }
 
 
@@ -81,15 +83,17 @@ class SerpApiSearcher:
         question: str,
         trusted_sites: List[str],
         num_results: int = 5,
-    ) -> tuple[List[WebHit], bool]:
+        prefer_docs: bool = True,
+    ) -> tuple[List[WebHit], bool, str]:
         """
         Run SerpApi Google search with site filter.
         
-        Returns (hits, used_credit).
-        used_credit is False if served from cache.
+        Returns (hits, used_credit, status).
+        status is one of: "cache_hit", "api_success", "api_failed", "no_key", "max_calls"
         """
-        site_filter = " OR ".join(f"site:{s}" for s in trusted_sites)
-        query = f"{question} ({site_filter})"
+        query = _build_keyword_query(question)
+        site_filter = f"site:{trusted_sites[0]}" if prefer_docs and trusted_sites else " OR ".join(f"site:{s}" for s in trusted_sites)
+        full_query = f"{query} {site_filter}"
         
         params = {
             "engine": "google",
@@ -98,42 +102,84 @@ class SerpApiSearcher:
             "num": num_results,
         }
         
-        cache_key = self._cache_key(query, params)
+        cache_key = self._cache_key(full_query, params)
         cached = self._read_cache(cache_key)
         
         if cached is not None:
             logger.info("SerpApi: served from cache (key=%s)", cache_key[:8])
             hits = self._parse_results(cached)
-            return hits, False
+            return hits, False, "cache_hit"
         
         if self.calls_made >= self.max_calls:
             logger.warning(
                 "SerpApi: max calls reached (%d/%d), skipping",
                 self.calls_made, self.max_calls
             )
-            return [], False
+            return [], False, "max_calls"
         
         if not self.api_key:
             logger.warning("SerpApi: no API key set, skipping")
-            return [], False
+            return [], False, "no_key"
         
         url = "https://serpapi.com/search"
         params["api_key"] = self.api_key
-        params["q"] = query
+        params["q"] = full_query
         
-        try:
-            logger.info("SerpApi: calling API (query=%r)", query[:80])
-            resp = httpx.get(url, params=params, timeout=10.0)
-            resp.raise_for_status()
-            data = resp.json()
-            self._write_cache(cache_key, data)
-            self.calls_made += 1
-            hits = self._parse_results(data)
-            logger.info("SerpApi: retrieved %d results (credit used)", len(hits))
-            return hits, True
-        except Exception as e:
-            logger.error("SerpApi call failed: %s", e)
-            return [], False
+        max_retries = 1
+        for attempt in range(max_retries + 1):
+            try:
+                logger.info("SerpApi: calling API (query=%r) attempt %d", full_query[:80], attempt + 1)
+                resp = httpx.get(url, params=params, timeout=30.0)
+                resp.raise_for_status()
+                data = resp.json()
+                self._write_cache(cache_key, data)
+                self.calls_made += 1
+                hits = self._parse_results(data)
+                organic_count = len(data.get("organic_results", []))
+                logger.debug("SerpApi: received %d organic_results", organic_count)
+                logger.info("SerpApi: retrieved %d results (credit used)", len(hits))
+                
+                if organic_count == 0 and not prefer_docs:
+                    return hits, True, "api_success"
+                elif organic_count == 0 and prefer_docs and self.calls_made < self.max_calls:
+                    logger.info("SerpApi: 0 results with docs preference, retrying without site filter")
+                    fallback_query = query
+                    fallback_params = dict(params)
+                    fallback_params["q"] = fallback_query
+                    fallback_key = self._cache_key(fallback_query, {k: v for k, v in fallback_params.items() if k != "api_key"})
+                    
+                    fallback_cached = self._read_cache(fallback_key)
+                    if fallback_cached:
+                        logger.info("SerpApi fallback: served from cache")
+                        hits = self._parse_results(fallback_cached)
+                        return hits, False, "cache_hit"
+                    
+                    try:
+                        resp2 = httpx.get(url, params=fallback_params, timeout=30.0)
+                        resp2.raise_for_status()
+                        data2 = resp2.json()
+                        self._write_cache(fallback_key, data2)
+                        self.calls_made += 1
+                        hits = self._parse_results(data2)
+                        logger.debug("SerpApi fallback: received %d organic_results", len(data2.get("organic_results", [])))
+                        logger.info("SerpApi fallback: retrieved %d results (2nd credit used)", len(hits))
+                        return hits, True, "api_success"
+                    except Exception as e2:
+                        logger.error("SerpApi fallback call failed: %s", e2)
+                        return [], True, "api_failed"
+                
+                return hits, True, "api_success"
+            except Exception as e:
+                logger.error("SerpApi call failed (attempt %d/%d): %s", attempt + 1, max_retries + 1, e)
+                if attempt < max_retries:
+                    import time
+                    backoff = 4 * (2 ** attempt)
+                    logger.info("Retrying in %ds...", backoff)
+                    time.sleep(backoff)
+                else:
+                    return [], False, "api_failed"
+        
+        return [], False, "api_failed"
     
     def _parse_results(self, data: Dict[str, Any]) -> List[WebHit]:
         """Parse organic_results from SerpApi JSON."""
@@ -149,7 +195,7 @@ class SerpApiSearcher:
                 continue
             
             hit_id = f"web:{hashlib.sha1(link.encode()).hexdigest()[:12]}"
-            text = f"{title}\n\n{snippet}"
+            text = f"{title}\n\n{snippet}" if snippet else title
             
             hits.append(
                 WebHit(
@@ -162,6 +208,23 @@ class SerpApiSearcher:
                 )
             )
         return hits
+
+
+def _build_keyword_query(question: str) -> str:
+    """Extract keywords from natural language question for better search results."""
+    import re
+    
+    stop_words = {
+        "what", "are", "the", "is", "how", "do", "does", "did", "can", "could",
+        "should", "would", "where", "when", "why", "which", "who", "for", "with",
+        "from", "to", "of", "in", "on", "at", "by", "a", "an", "i", "you"
+    }
+    
+    words = re.findall(r'\w+', question.lower())
+    
+    keywords = [w for w in words if w not in stop_words and len(w) > 2]
+    
+    return " ".join(keywords[:8]) if keywords else question
 
 
 def should_trigger_web_search(

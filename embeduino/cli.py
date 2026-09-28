@@ -23,12 +23,17 @@ console = Console()
 
 
 def _setup_logging(verbose: bool) -> None:
-    level = logging.DEBUG if verbose else logging.INFO
+    level = logging.INFO if verbose else logging.WARNING
     logging.basicConfig(
         level=level,
         format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
         datefmt="%H:%M:%S",
     )
+    
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("sentence_transformers").setLevel(logging.WARNING)
+    logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
+    logging.getLogger("chromadb").setLevel(logging.WARNING)
 
 
 @click.group()
@@ -150,35 +155,34 @@ def ask_cmd(
     console.print(Panel(result.answer, title="Answer", border_style=style))
     
     if result.web_search_used:
-        if result.web_credit_used:
+        if result.web_status == "cache_hit":
+            console.print("[green]Web search served from cache (0 SerpApi credits)[/]")
+        elif result.web_status == "api_success" and result.web_credit_used:
             console.print("[yellow]Web search used (1 SerpApi credit)[/]")
+        elif result.web_status == "api_failed":
+            console.print("[red]Web search failed (network error)[/]")
+        elif result.web_status == "no_key":
+            console.print("[dim]Web search skipped (no API key)[/]")
+        elif result.web_status == "max_calls":
+            console.print("[dim]Web search skipped (max calls reached)[/]")
         else:
-            console.print("[green]Web search served from cache (0 credits)[/]")
+            console.print("[dim]Web search: unknown status[/]")
     else:
         console.print("[dim]Web search: not triggered[/]")
 
-    table = Table(title="Citations / retrieved chunks", show_lines=True)
-    table.add_column("ID", style="cyan", no_wrap=True)
-    table.add_column("Score", justify="right")
-    table.add_column("RRF", justify="right")
-    table.add_column("Origin")
-    table.add_column("Source")
-    table.add_column("Heading")
-    table.add_column("Preview")
-    for c in result.citations:
-        rrf_str = f"{c['rrf_score']:.3f}" if c.get("rrf_score") else ""
-        table.add_row(
-            str(c["id"]),
-            f"{c['score']:.3f}",
-            rrf_str,
-            c.get("origin", "local"),
-            str(c.get("source", ""))[:30],
-            str(c.get("heading_path", ""))[:30],
-            (c.get("preview") or "")[:60],
-        )
-    console.print(table)
+    console.print("\n[bold]Citations:[/]")
+    for i, c in enumerate(result.citations, 1):
+        origin_badge = "[cyan][web][/]" if c.get("origin") == "web" else "[dim][local][/]"
+        rrf_str = f" rrf={c['rrf_score']:.3f}" if c.get("rrf_score") else ""
+        console.print(f"{i}. {origin_badge} [cyan]{c['id']}[/] score={c['score']:.3f}{rrf_str}")
+        if c.get("url"):
+            console.print(f"   URL: {c['url']}")
+        console.print(f"   Source: {c.get('source', '')}")
+        console.print(f"   Heading: {c.get('heading_path', '')}")
+        console.print(f"   Preview: {(c.get('preview') or '')[:80]}...")
+        console.print("")
 
-    console.print("\n[dim]Retrieved chunk ids:[/]")
+    console.print("[dim]Retrieved chunk ids:[/]")
     for h in result.retrieved:
         meta = h.get("metadata") or {}
         console.print(

@@ -1,0 +1,22 @@
+{
+  "organic_results": [
+    {
+      "position": 1,
+      "title": "name of the arduino pin size - #14 by system",
+      "link": "https://forum.arduino.cc/t/name-of-the-arduino-pin-size/549347/14",
+      "snippet": "hi all, I think I have a very simple question, but can't find it on DuckDuck... What is the size of the pins called on an Arduino?"
+    },
+    {
+      "position": 2,
+      "title": "Are the input pins so high resistance that resistors are not ...",
+      "link": "https://forum.arduino.cc/t/are-the-input-pins-so-high-resistance-that-resistors-are-not-required/1390146?page=3",
+      "snippet": "You can safely connect a 3.3V power supply directly to an input pin on the Arduino Uno R4 WiFi, as long as that pin is set as an input."
+    },
+    {
+      "position": 3,
+      "title": "Board layout for R4 Wifi (& Minima) ?",
+      "link": "https://forum.arduino.cc/t/board-layout-for-r4-wifi-minima/1183668",
+      "snippet": "The Arduino UNO R4 WiFi is designed around the 32-bit microcontroller RA4M1 from Renesas while also featuring a ESP32 module for Wi-Fi® and ..."
+    }
+  ]
+}
