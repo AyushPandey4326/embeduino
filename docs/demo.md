@@ -173,6 +173,7 @@ echo "Setup: see README.md"
 4. **DO NOT show** `.env` or the API key on screen
 5. **Open in incognito** if uploading to YouTube / Drive for submission
 6. **Keep under 3:00** (or trim to 3:00 in post)
+7. **Windows users**: Set `PYTHONUTF8=1` or run `chcp 65001` before recording to avoid encoding errors
 
 ---
 

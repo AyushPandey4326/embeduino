@@ -172,6 +172,8 @@ python3 -m embeduino ingest --reset --strategy fixed
 
 Requirements: Python 3.10+, ~1GB disk for the embedding model on first run.
 
+**Windows users**: Set `PYTHONUTF8=1` in your environment or use `chcp 65001` before running to avoid encoding errors with web search results containing non-ASCII characters.
+
 ```bash
 cd /workspace
 python3 -m venv .venv && source .venv/bin/activate
