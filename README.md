@@ -217,6 +217,7 @@ Edit `.env` or set environment variables:
 | **`EMBEDUINO_WEB_SITES`** | **`docs.arduino.cc github.com forum.arduino.cc`** | **Trusted sites (space-separated)** |
 | **`EMBEDUINO_SERP_CACHE`** | **`.serp_cache`** | **On-disk cache directory (gitignored)** |
 | **`EMBEDUINO_SERP_MAX_CALLS`** | **`10`** | **Max SerpApi calls per run (credit cap)** |
+| **`SERPAPI_TIMEOUT_S`** | **`90`** | **SerpApi search timeout (seconds, includes async polling)** |
 | **`EMBEDUINO_RRF_K`** | **`60`** | **Reciprocal Rank Fusion k parameter** |
 
 Never commit `.env`, API keys, or cache directories.
