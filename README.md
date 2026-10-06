@@ -339,11 +339,6 @@ Tests cover:
 5. **Free tier limits**: 250 searches/month; exceed that and API calls fail
 6. **Windows encoding**: Run with `PYTHONUTF8=1` or `chcp 65001` to handle non-ASCII characters in web results
 
----
-
-## AI Tools Used
-
-This hackathon work was built with **AI coding assistance** (Cursor). All code, tests, and documentation were developed collaboratively with AI support.
 
 ---
 
